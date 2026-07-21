@@ -231,14 +231,18 @@ Design points:
   decision to store relative POSIX paths is what makes local paths and S3
   keys the same string.
 - Progress: `logging.info` every 1 000 files with running MiB/s; final
-  one-line summary via `print` (CLI console output, allowed).
+  one-line summary via `print` — files, bytes, elapsed, **and throughput
+  (MiB/s, files/s)** — so a `seed` run doubles as a quick throughput check
+  (CLI console output, allowed). `--json` (§5.2) emits those same figures as
+  one machine-readable object on stdout for scripting and the §8.2 throughput
+  integration test.
 
 ### 5.2 CLI shape
 
 ```bash
 python -m rgw_ingest_bench seed --tier medium --bucket bronze --seed 42 \
        [--endpoint http://localhost:8000] [--jobs 16] [--resume] [--no-verify] \
-       [--manifest-out manifests/]
+       [--manifest-out manifests/] [--json]
 ```
 
 Tier/explicit-spec flag groups are shared with `generate` via a common
@@ -372,7 +376,8 @@ def append_result(result: RunResult, path: Path) -> None
   (`command="seed"`, counters = bytes/PUT counts, one `LatencySummary` for
   PUTs, full `EnvInfo`) into `results/seed.jsonl`. Metrics code therefore has
   a real production caller in this same PR, not just tests — and seeding
-  throughput regressions become visible for free.
+  throughput regressions become visible for free (the `seed --json` summary
+  surfaces the same `files_per_s` / byte-rate that §8.2's I1 asserts on).
 - Analysis side stays `polars.read_ndjson` (PR 6); nothing in `metrics.py`
   imports pandas or pyarrow.
 
@@ -384,7 +389,14 @@ Same regime as PR 1: `pytest` + fixtures, `tmp_path` everywhere, 100 %
 line/branch on new Python code. New dev deps: **`moto[server]`** (in-process
 S3 for seed tests — CI needs no Docker) and **`pytest-asyncio`** (sampler
 tests). The shell script and compose file are validated by lightweight checks
-(T12), not unit-tested.
+(T12), not unit-tested. The plan splits into fast, moto-backed **unit tests**
+(§8.1, which carry the 100 % coverage gate), **integration tests** against a
+live object store (§8.2, where CLI throughput is verified), and a **run
+walkthrough** (§8.3). The `minio` and `netem` markers are registered in
+`pyproject.toml` `[tool.pytest.ini_options]`, so `-m "not minio and not netem"`
+selects the fast gate.
+
+### 8.1 Unit test matrix
 
 | # | Test | Asserts (incl. unhappy paths) |
 |---|---|---|
@@ -402,11 +414,117 @@ tests). The shell script and compose file are validated by lightweight checks
 | T12 | `test_fixture_files` | `docker compose config` parses both profiles (skipped if no docker CLI); images are digest-pinned (regex on the YAML); `netem.sh` passes shellcheck if available |
 | T13 | `test_cli_seed_args` | bad tier, missing endpoint, conflicting flag groups → nonzero exit + usage; `rtt-probe` command wired |
 | T14 | `test_iter_file_chunks_equivalence` | PR 1 refactor guard: chunks concatenated == `generate_file` output byte-for-byte (complements PR 1 T9) |
+| T15 | `test_seed_json_summary` | `seed --json` (driven in-process via `cli.main([...])` against moto) prints one stats object `{files, bytes, elapsed_s, mib_per_s, files_per_s}`; `files == n_files`, `bytes == Σ` manifest sizes, rates self-consistent (`mib_per_s == bytes/elapsed_s/2**20`, `files_per_s == files/elapsed_s`) — covers the throughput-summary branch for the coverage gate; the figures equal the `results/seed.jsonl` `RunResult` row |
 
-Integration marks: `@pytest.mark.minio` duplicates T9–T11 against a live
-MinIO (`make minio-up`) to keep moto honest about multipart semantics —
-run in CI's integration job, skipped locally by default (parent §12's
-"MinIO/moto integration marks").
+### 8.2 Integration tests (live object store)
+
+The unit suite above runs against **moto** (in-process, no Docker): it proves
+*correctness* but says nothing about *throughput* — moto never touches a socket.
+These integration tests drive the **real CLI** (`sys.executable -m
+rgw_ingest_bench …` as a subprocess) against a **live** store — MinIO for CI
+(`make minio-up`), RGW for headline numbers (`make rgw-up`) — pointed at it via
+the `BENCH_S3_*` env. Marked `@pytest.mark.minio`, run in CI's integration job
+and skipped locally by default (parent §12's "MinIO/moto integration marks").
+
+| # | Test | Asserts |
+|---|---|---|
+| I1 | `test_seed_throughput_cli` | **the CLI throughput check.** `seed --tier small --json` into the live bucket as a subprocess; parse the stats object `{files, bytes, elapsed_s, mib_per_s, files_per_s}`. Assert `files == n_files` and `bytes == Σ` on-store `LIST` sizes (upload accounting is correct); `mib_per_s == bytes/elapsed_s/2**20` within 1 % (**reported throughput is accurate**, not merely present); `elapsed_s ≤` the test's own wall-clock; an **opt-in floor** — when `BENCH_MIN_SEED_MIB_PER_S` is set, the measured `mib_per_s` must clear it; unset ⇒ accounting-only, so CI never flakes on hardware (suggested trusted-loopback value ≈ 5 MiB/s) — a serialized-upload / non-streaming regression trips wherever the floor is set; finally the stdout figures equal the `results/seed.jsonl` `RunResult` row (`wall_s`, `files_per_s`, byte counters) — CLI, sink, and store all agree. |
+| I2 | `test_seed_correctness_minio` | the T9–T11 duplication against **real multipart**: object count/sizes/manifest + `RunResult` row (T9); truncate one object → verify exits nonzero naming the key (T10); interrupt-then-`--resume` uploads only the missing keys, and `--jobs 1` vs `--jobs 8` stay byte-identical (T11). Keeps moto honest about the multipart semantics RGW/MinIO actually enforce. |
+| I3 | `test_rtt_probe_netem` | the §6 latency loop end-to-end through the CLI: with `scripts/netem.sh set <d>` applied, `rtt-probe` reads median ≈ `2·d` + baseline; after `clear`, back to baseline. Marked `@pytest.mark.netem` and **skipped unless** `BENCH_NETEM=1` and the process can `sudo tc` (root + Linux) — otherwise it stays the §9 manual acceptance step. |
+
+**Throughput contract (mirrors PR 1's `generate --json`).** So a test — or an
+operator — can *verify* seed throughput without scraping log lines, `seed` grows
+the same machine-readable summary: `--json` prints exactly one JSON object to
+stdout, `{"files", "bytes", "elapsed_s", "mib_per_s", "files_per_s"}`, and
+suppresses the human summary so stdout stays valid JSON. These are the same
+numbers `seed` already records in the `results/seed.jsonl` `RunResult` row
+(§7.2); I1 parses the object and cross-checks it against that row. The floor is
+opt-in via `BENCH_MIN_SEED_MIB_PER_S` (the PR 1 §7.2 `BENCH_MIN_<command>_<rate>`
+convention — subcommand + the rate it bounds) and a regression tripwire, **not**
+a benchmark — real seed-throughput and latency-inflation numbers are the
+variants' job (PR 3+) and the PR 6 figures.
+
+### 8.3 Running the integration tests (walkthrough)
+
+The unit/moto suite needs nothing but an install; the integration tests need a
+live store. From the harness root:
+
+```bash
+pip install -e ".[dev]"              # moto, pytest-asyncio, pytest-cov, …
+```
+
+**1 — Fast gate (no Docker, no store): unit + moto, with coverage:**
+
+```bash
+pytest -m "not minio and not netem" \
+       --cov=rgw_ingest_bench --cov-branch --cov-fail-under=100
+```
+
+**2 — Bring up a live store** (MinIO is the zero-Ceph path CI uses):
+
+```bash
+make minio-up                        # or: make rgw-up   (headline numbers)
+export BENCH_S3_ENDPOINT=http://localhost:9000
+export BENCH_S3_ACCESS_KEY=bench BENCH_S3_SECRET_KEY=bench-secret
+export BENCH_S3_KIND=minio           # must match the store you started
+```
+
+**3 — Run the integration tests** (`seed` correctness + the throughput check):
+
+```bash
+pytest -m minio -v
+```
+
+**4 — Just the throughput test (I1), watching the number** — `-s` un-captures
+stdout so the measured MiB/s prints:
+
+```bash
+pytest -m minio -k throughput -s
+```
+
+The absolute floor is opt-in: set `BENCH_MIN_SEED_MIB_PER_S` to enforce it on a
+store/host you trust (leave it unset ⇒ accounting-only, so CI never flakes on
+hardware variance):
+
+```bash
+BENCH_MIN_SEED_MIB_PER_S=50 pytest -m minio -k throughput
+# Windows PowerShell:  $env:BENCH_MIN_SEED_MIB_PER_S=50; pytest -m minio -k throughput
+```
+
+**5 — Verify seed throughput by hand (exactly what I1 automates):**
+
+```bash
+python -m rgw_ingest_bench seed --tier small --bucket bronze --seed 42 --json
+# {"files": 10000, "bytes": 1719664640, "elapsed_s": 21.3, "mib_per_s": 77.0, "files_per_s": 469.5}
+
+python -m rgw_ingest_bench seed --tier small --bucket bronze --json | jq .mib_per_s
+```
+
+**6 — (Linux, optional) verify the netem latency loop (I3):**
+
+```bash
+make netem-set DELAY=1ms
+python -m rgw_ingest_bench rtt-probe          # median ≈ 2 ms above baseline
+make netem-clear
+BENCH_NETEM=1 pytest -m netem                 # automates the above (needs sudo tc)
+```
+
+**7 — Tear down:**
+
+```bash
+make minio-down                      # or make rgw-down  (compose down -v: full reset)
+```
+
+Notes:
+
+- The 100 % coverage gate runs *only* on `-m "not minio and not netem"`:
+  subprocess/live-store tests register no lines, so the moto unit suite carries
+  the gate (the `seed --json` branch is covered in-process by T15).
+- `BENCH_S3_KIND` must match the store you actually started — a mismatch is
+  precisely the RGW-vs-MinIO mislabel §4 guards against, and every result row
+  records it.
+- Integration tests write only under a unique per-run bucket/prefix and clean up
+  after themselves; `compose down -v` is the hard reset if a run is killed.
 
 ---
 
@@ -420,7 +538,11 @@ run in CI's integration job, skipped locally by default (parent §12's
       `netem-clear` restores it (numbers recorded in the PR description).
 - [ ] `results/seed.jsonl` row validates against `RunResult`, contains
       measured RTT + all package versions + git SHA.
-- [ ] moto suite green without Docker; `@pytest.mark.minio` suite green in CI.
+- [ ] Fast gate green without Docker (`pytest -m "not minio and not netem"`,
+      100 % coverage); `pytest -m minio` (live store) green in CI — including
+      I1 `test_seed_throughput_cli`, whose `--json` throughput is self-consistent
+      and matches the `results/seed.jsonl` row (verified by hand once via
+      `seed --tier small --json`, §8.3).
 - [ ] 100 % line/branch coverage on new Python; images digest-pinned; no
       pandas/pyarrow imports; secrets only test constants.
 

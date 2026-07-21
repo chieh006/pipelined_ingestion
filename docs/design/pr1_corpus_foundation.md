@@ -22,7 +22,7 @@ Deliver the data layer every later PR stands on:
 3. **`fakeraw.py`** — a streamed, deterministic corpus generator driven by a
    Pydantic spec.
 4. **`manifest.py`** — JSONL manifest write/read (`path, size, has_footer,
-   file_id`), later consumed by V3's manifest mode and the §7.3 correctness gate.
+   file_id`), later consumed by V3's manifest mode and the §7.2 correctness gate (I1).
 5. **`parse.py`** — header/footer parsing (`np.frombuffer` at fixed offsets),
    footer-presence arithmetic, and the pixel-pattern guard.
 6. **A minimal CLI**: `python -m rgw_ingest_bench generate` (local disk only).
@@ -71,6 +71,7 @@ rgw-ingest-bench/
     test_parse.py
     test_manifest.py
     test_cli.py
+    test_integration.py           # @pytest.mark.integration: CLI end-to-end + throughput
 ```
 
 `pyproject.toml`:
@@ -79,9 +80,14 @@ rgw-ingest-bench/
 - Runtime deps (pinned, parent §4): `numpy`, `pydantic>=2`, `polars`.
   (`pyarrow`, `s3fs`/`aiobotocore`, `uvloop` are **not** needed until PR 2/5 —
   do not add them here; every dep added now is a dep CI installs forever.)
-- Dev deps: `pytest`, `pytest-cov`.
+- Dev deps: `pytest`, `pytest-cov`, `psutil` (dev-only; backs the §7.2 RSS
+  streaming check — I3 `skipif`s when it is absent).
 - Coverage config: `fail_under = 100` scoped to `src/rgw_ingest_bench`
-  (branch coverage on).
+  (branch coverage on), measured on the fast `-m "not integration"` run.
+- Register the marker under `[tool.pytest.ini_options]`
+  (`markers = ["integration: end-to-end CLI tests (subprocess, slow)"]`) so
+  `-m "not integration"` selects the fast/coverage gate and strict-marker runs
+  don't warn.
 
 All paths handled via `pathlib.Path`; no `os.path` string joins. All functions
 carry NumPy-style docstrings. Logging via `logging` with f-strings; `print()`
@@ -285,7 +291,7 @@ def read_manifest_df(path: Path) -> pl.DataFrame
   equal across Windows/Linux.
 - `read_manifest` re-validates every line through Pydantic (a truncated or
   hand-edited manifest fails loudly). `read_manifest_df` uses
-  `polars.read_ndjson` — this is what the §7.3 correctness gate and the
+  `polars.read_ndjson` — this is what the §7.2 correctness gate (I1) and the
   analysis scripts will join against later.
 
 ---
@@ -330,7 +336,12 @@ def verify_pixel_range(buf: bytes, file_id: int, start: int) -> bool
 `pytest` + fixtures throughout (no `unittest`); `tmp_path` for every file the
 tests create. A `tiny_spec` fixture (`8×8×1, n_files=6, footer_ratio=0.5,
 seed=7`) keeps the suite fast (<2 s); one `medium`-geometry single-file test
-covers the multi-chunk streaming path.
+covers the multi-chunk streaming path. The plan splits into fast, in-process
+**unit tests** (§7.1) and slower, subprocess-driven **integration tests**
+(§7.2) that drive the CLI end to end — including the throughput check an
+operator runs by hand.
+
+### 7.1 Unit test matrix
 
 | # | Test | Asserts (including unhappy paths) |
 |---|---|---|
@@ -345,12 +356,115 @@ covers the multi-chunk streaming path.
 | T9 | `test_streaming_equivalence` | chunked write (small `chunk_size`) produces bytes identical to a one-shot reference build; file size matches `expected_size` |
 | T10 | `test_footer_ratio_edges` | `footer_ratio=0.0` → no footers, `=1.0` → all footers; manifest `has_footer` matches on-disk sizes for every file |
 | T11 | `test_manifest_roundtrip` | write → `read_manifest` equality; `read_manifest_df` shape/dtypes; corrupted line → loud failure; sizes in manifest match `Path.stat()` |
-| T12 | `test_cli_generate` | CLI in `tmp_path` creates `n_files` files + manifest; exit code 0; unknown tier / missing args → non-zero exit + usage message |
+| T12 | `test_cli_generate` | CLI in `tmp_path` creates `n_files` files + manifest; exit code 0; `--json` mode (driven in-process via `cli.main([...])`) emits a valid stats object with the five keys and correct `files`/`bytes` — covers the throughput-summary branch for the 100 % gate; unknown tier / missing args → non-zero exit + usage message |
 
 Coverage: 100 % line + branch on all six modules (project guideline §6);
 enforced via `--cov --cov-branch --cov-fail-under=100` in CI config (the CI
 workflow file itself may land in PR 2 with the rest of the infra — the local
-`pytest` invocation in the README carries the flags until then).
+`pytest` invocation in the README carries the flags until then). The gate is
+met by the in-process unit tests above (T1–T12 all call library functions or
+`cli.main([...])` directly); the §7.2 integration tests shell out to a
+subprocess, add no line coverage, and so run *outside* the gate —
+`pytest -m "not integration" --cov …` enforces 100 %, `pytest -m integration`
+runs the end-to-end pass.
+
+### 7.2 Integration tests (`test_integration.py`)
+
+End-to-end tests that drive the **real CLI** (`sys.executable -m
+rgw_ingest_bench …` as a subprocess — closest to how an operator invokes it)
+across the whole stack (`cli → fakeraw → manifest → parse → layout`) against a
+real filesystem. Marked `@pytest.mark.integration` so the fast unit suite stays
+<2 s (`pytest -m "not integration"`); the full pass is `pytest` or
+`pytest -m integration`. Geometry stays small (tens of files) so wall-clock is
+a few seconds — except I3, which needs one `large`-geometry file to exercise
+streaming.
+
+| # | Test | Asserts |
+|---|---|---|
+| I1 | `test_cli_roundtrip_corpus` | `generate` into `tmp_path`, then reload `manifest.jsonl` and, for **every** entry: on-disk `stat().st_size == entry.size == expected_size(...)`; `parse_header` fields equal the §4.2 formulas; `has_footer` files `parse_footer` cleanly with `file_id_echo == file_id`; a mid-pixel ranged slice passes `verify_pixel_range`. Realizes the full-corpus **correctness gate** referenced by §5/§6, exercised through the CLI. |
+| I2 | `test_cli_throughput` | run `generate --json`, parse the stats object (`files, bytes, elapsed_s, mib_per_s, files_per_s`). Assert `files == n_files` and `bytes == Σ` on-disk sizes (CLI accounting is correct); assert `mib_per_s == bytes / elapsed_s / 2**20` within 1 % (**reported throughput is accurate**, not merely present); assert `elapsed_s ≤` the test's own wall-clock around the subprocess; assert an **opt-in floor** — when `BENCH_MIN_GENERATE_MIB_PER_S` is set, the measured `mib_per_s` must clear it; unset ⇒ accounting-only, so CI never flakes on machine variance (suggested trusted-machine value ≈ 20 MiB/s) — a non-streaming / O(n²) regression trips wherever the floor is set. |
+| I3 | `test_cli_memory_streaming` | generate one `large`-geometry file (~32 MiB) via the CLI subprocess while sampling the child's peak RSS (`psutil`; `skipif` when unavailable); assert peak RSS stays under a small multiple of `chunk_size` and well below the file size — the executable proof of the §4.4 "never all in RAM" claim. |
+| I4 | `test_cli_determinism_e2e` | two `generate` runs, same `--seed`, different out dirs → byte-identical `manifest.jsonl` and identical per-file SHA-256 across the corpus; a third run with a different `--seed` → a differing manifest. Promotes T8's determinism claim to a through-the-CLI check. |
+
+**Throughput contract (drives the small §8 CLI addition).** So a test — or an
+operator — can *verify* throughput without scraping free text, `generate` grows
+a machine-readable summary: `--json` prints exactly one JSON object to stdout,
+`{"files", "bytes", "elapsed_s", "mib_per_s", "files_per_s"}`; without `--json`
+the human summary (§8) simply gains the two rate figures. I2 parses that object.
+Its floor is opt-in and a regression tripwire, **not** a benchmark — real,
+netem-aware throughput numbers are PR 2's `metrics.py` job (non-goal here). The
+floor env var follows a convention shared by every later PR:
+`BENCH_MIN_<command>_<rate>`, naming the CLI subcommand and the throughput rate
+it bounds — `BENCH_MIN_GENERATE_MIB_PER_S` / `BENCH_MIN_SEED_MIB_PER_S` bound
+`mib_per_s`, `BENCH_MIN_RUN_FILES_PER_S` bounds `run`'s median `files_per_s`.
+
+### 7.3 Running the tests (walkthrough)
+
+From the harness root (the directory holding `pyproject.toml`), in a fresh
+virtualenv:
+
+```bash
+python -m venv .venv
+. .venv/bin/activate                 # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"              # pulls in pytest-cov + psutil
+```
+
+**1 — Everyday loop: fast unit suite + coverage gate** (no subprocess, <2 s):
+
+```bash
+pytest -m "not integration" --cov=rgw_ingest_bench --cov-branch --cov-fail-under=100
+```
+
+**2 — The integration tests** (I1–I4; each shells out to a real
+`rgw_ingest_bench` process and writes only under pytest's `tmp_path`):
+
+```bash
+pytest -m integration -v
+```
+
+**3 — Just the throughput test (I2), watching the number** — `-s` un-captures
+stdout so the measured rate prints:
+
+```bash
+pytest -m integration -k throughput -s
+```
+
+I2 always asserts the CLI's throughput *accounting* is correct; the absolute
+floor is opt-in. Set `BENCH_MIN_GENERATE_MIB_PER_S` to enforce a floor on a
+machine you trust (leave it unset ⇒ accounting-only, so CI never flakes on
+hardware variance); a good starting value on local disk is ≈ 20 MiB/s:
+
+```bash
+BENCH_MIN_GENERATE_MIB_PER_S=50 pytest -m integration -k throughput
+# Windows PowerShell:  $env:BENCH_MIN_GENERATE_MIB_PER_S=50; pytest -m integration -k throughput
+```
+
+**4 — Verify throughput by hand (exactly what I2 automates)** — run the CLI with
+`--json` and read the rate straight off stdout:
+
+```bash
+python -m rgw_ingest_bench generate --tier small --out ./corpus --json
+# {"files": 10000, "bytes": 1719664640, "elapsed_s": 6.7, "mib_per_s": 244.8, "files_per_s": 1492.5}
+
+python -m rgw_ingest_bench generate --tier small --out ./corpus --json | jq .mib_per_s
+```
+
+**5 — Everything at once** (unit + integration), e.g. a pre-push check:
+
+```bash
+pytest
+```
+
+Notes:
+
+- The 100 % coverage gate is run *only* on the `-m "not integration"` selection:
+  subprocess tests register no lines (§7.2), so including them would make the
+  gate unmeetable. CI runs the two selections as separate jobs.
+- I3 (`test_cli_memory_streaming`) needs `psutil` and `skip`s automatically if
+  it is absent, so the suite still passes on a minimal environment.
+- Editing source needs no reinstall — `pip install -e` is editable and the
+  integration tests launch the package via `sys.executable -m rgw_ingest_bench`,
+  so they pick up live code. Reinstall only when entry points or deps change.
 
 ---
 
@@ -360,13 +474,20 @@ workflow file itself may land in PR 2 with the rest of the infra — the local
 python -m rgw_ingest_bench generate --tier medium --out ./corpus [--seed 42]
 python -m rgw_ingest_bench generate --n-files 100 --width 256 --height 256 \
                                     --channels 1 --out ./corpus   # explicit spec
+python -m rgw_ingest_bench generate --tier small --out ./corpus --json  # machine-readable stats
 ```
 
 - `argparse` subcommands; `--tier` and the explicit-spec flags are mutually
   exclusive groups. The command builds a `FakeRawSpec`, calls
   `generate_corpus`, streams the manifest to `<out>/manifest.jsonl`, and
-  prints a one-line summary (files, bytes, elapsed) — `print` is acceptable
-  here (CLI console output); progress uses `logging`.
+  prints a one-line summary — files, bytes, elapsed, **and throughput
+  (MiB/s, files/s)**, so a `generate` run doubles as a quick local throughput
+  check. `print` is acceptable here (CLI console output); progress uses
+  `logging`.
+- `--json` emits that same summary as one JSON object on stdout
+  (`{"files", "bytes", "elapsed_s", "mib_per_s", "files_per_s"}`) and
+  suppresses the human line so stdout stays valid JSON — this is what the §7.2
+  `test_cli_throughput` integration test parses.
 - PR 2 adds `seed` (upload) beside it; the subcommand registry is a dict so
   that addition is one entry.
 
@@ -374,11 +495,15 @@ python -m rgw_ingest_bench generate --n-files 100 --width 256 --height 256 \
 
 ## 9. Acceptance checklist (PR review gate)
 
-- [ ] `pip install -e .[dev] && pytest` passes on a clean machine, no Docker.
+- [ ] `pip install -e .[dev] && pytest` passes on a clean machine, no Docker
+      (fast gate `pytest -m "not integration" --cov …` at 100 %; full pass
+      `pytest -m integration` green).
 - [ ] `generate --tier small` on a laptop: ~1.6 GiB corpus, flat memory
-      profile (spot-check RSS), manifest line count = 10 000.
-- [ ] Same-seed rerun reproduces byte-identical output (T8 also run manually
-      once on `small`).
+      profile (spot-check RSS, now covered by I3), manifest line count =
+      10 000, and the printed throughput figure is non-trivial (I2 verifies its
+      accounting).
+- [ ] Same-seed rerun reproduces byte-identical output (T8 / I4 also run
+      manually once on `small`).
 - [ ] 100 % line/branch coverage on new code; no `pandas`, no `print` outside
       `cli.py`, all paths via `pathlib`, NumPy-style docstrings throughout.
 - [ ] No production offsets beyond parent §3.1's synthetic schema (clean-room

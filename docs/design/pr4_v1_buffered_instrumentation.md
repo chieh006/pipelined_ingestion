@@ -219,6 +219,15 @@ on new code. Key trick: **the S > readahead (`large`) regime is unit-tested
 without 32 MiB files** by opening with a tiny explicit `block_size` in the
 *test only* (T6) — the audit logic doesn't care whether the cap came from a
 5 MiB default or a 64 KiB override; V1 production code still never passes one.
+The plan splits into fast, moto-backed **unit tests** (§6.1, which carry the
+100 % coverage gate), **integration tests** against a live store (§6.2, where
+V1's bytes-moved throughput is verified through the CLI), and a **run
+walkthrough** (§6.3). `run --variant v1` reuses PR 3's `run --json` summary and
+the `BENCH_MIN_RUN_FILES_PER_S` floor unchanged — V1 is a new registry entry,
+not a new command — plus the `minio` / `netem` markers registered by PR 2; the
+fast gate is `-m "not minio and not netem"`.
+
+### 6.1 Unit test matrix
 
 | # | Test | Asserts (incl. unhappy paths) |
 |---|---|---|
@@ -232,7 +241,122 @@ without 32 MiB files** by opening with a tiny explicit `block_size` in the
 | T8 | `test_audit_restores_on_exception` | variant raising mid-run → `_fetch_range` is the original afterward; nested/duplicate audit → explicit error (no silent double-patch) |
 | T9 | `test_make_fs_leaves_defaults` | PR 2's `make_fs` passes no block-size/cache kwargs; recorded `params["s3fs_block_size"]` equals the library default at test time |
 | T10 | `test_params_recorded` | block size, cache type, fetch-size summary present in the RunResult row; distribution numbers consistent with records |
-| T11 | `@pytest.mark.minio` | T1–T3 against live MinIO — real HTTP Range semantics vs moto's |
+### 6.2 Integration tests (live object store)
+
+s3fs readahead is *client-side*, so moto already exercises it (T2/T6 measure the
+fetch counters against moto). Two things moto cannot give: **real HTTP Range
+semantics** (how RGW/MinIO answer suffix and clipped ranges — what the §4 table
+ultimately rides on) and **throughput** (moto is in-process — no wall time, no
+MiB/s). These tests drive the **real CLI** (`sys.executable -m rgw_ingest_bench
+…` as a subprocess) against a **live** store (MinIO for CI via `make minio-up`,
+RGW for headline numbers via `make rgw-up`), pointed at it with the `BENCH_S3_*`
+env. Marked `@pytest.mark.minio`; run in CI's integration job, skipped locally by
+default. They reuse PR 3's `run --json` summary and the
+`BENCH_MIN_RUN_FILES_PER_S` floor unchanged — `run --variant v1` is a registry
+entry, not a new command.
+
+| # | Test | Asserts |
+|---|---|---|
+| I1 | `test_run_v1_throughput_cli` | **the CLI throughput check.** Seed a corpus, then `run --variant v1 --schema scalar --repeat 2 --json` as a subprocess; parse PR 3's summary `{files, bytes, gate_passed, wall_s_median, files_per_s_median, mib_per_s_median, …}`. Assert `gate_passed` and `files == n_files`; `files_per_s_median == files/wall_s_median` and `mib_per_s_median == bytes/wall_s_median/2**20` within 1 % (**reported throughput is accurate**); `bytes` equals the run's `bytes_fetched_audit` counter and is ≫ the ~64 KiB/file V2 would move (readahead is visible in the headline number); reuse the **opt-in** `BENCH_MIN_RUN_FILES_PER_S` floor (unset ⇒ accounting-only, so CI never flakes; the value is calibrated per variant+tier, lower for V1 since it moves whole files); finally the stdout medians reconcile with the measured rows in `results/runs.jsonl`. |
+| I2 | `test_v1_vs_v2_bytes_and_hash_cli` | **the H1 headline, CLI-verified.** `run --variant v1` and `run --variant v2` over the same seeded bucket/schema; assert **identical `content_hash`** (the §5 cross-variant invariant — same silver from wildly different I/O) *and* that `bytes_v1 / bytes_v2` matches the §4 prediction for the seeded geometry (a bounded range, not an exact constant, so readahead variance doesn't flake) — the ~17× headline is the `medium` instantiation; CI seeds a smaller tier and asserts that tier's own ratio. The data behind PR 6's two-bar H1 figure, proven through the CLI before it is plotted. |
+| I3 | `test_run_v1_taps_fidelity_minio` | the former T11 against **real HTTP Range semantics**: cross-variant hash == V2 (T1), per-file fetch counts match the §4 regime (T2), and the two independent taps agree — `bytes_fetched_audit == bytes_fetched_wire`, `get_count == get_count_wire` (T3) — on ranges a real server answered, not moto's approximation. Tap disagreement ⇒ repetition invalid (§5.2), asserted loud. |
+
+**Throughput contract — inherited, not re-declared.** V1 adds no CLI surface:
+`run --json` (PR 3 §7) already emits the medians summary this PR's I1 parses, and
+its `bytes` field now carries V1's `bytes_fetched_audit` total, so the readahead
+shows up directly in the same `mib_per_s_median` an operator already reads. The
+floor stays the shared `BENCH_MIN_RUN_FILES_PER_S` (PR 1 §7.2
+`BENCH_MIN_<command>_<rate>` convention) — one floor for the `run` command,
+whatever the variant. V1's *distinctive* verification is bytes-moved (I2), not a
+rate floor; the rate floor is just the generic don't-hang tripwire.
+
+### 6.3 Running the integration tests (walkthrough)
+
+The unit/moto suite needs only an install; the integration tests need a live
+store. From the harness root:
+
+```bash
+pip install -e ".[dev]"              # moto, pyarrow, pytest-cov, … (no new PR-4 deps)
+```
+
+**1 — Fast gate (no Docker, no store): unit + moto, with coverage:**
+
+```bash
+pytest -m "not minio and not netem" \
+       --cov=rgw_ingest_bench --cov-branch --cov-fail-under=100
+```
+
+**2 — Bring up a live store and point the client at it:**
+
+```bash
+make minio-up                        # or: make rgw-up   (headline numbers + rgw-stats)
+export BENCH_S3_ENDPOINT=http://localhost:9000
+export BENCH_S3_ACCESS_KEY=bench BENCH_S3_SECRET_KEY=bench-secret
+export BENCH_S3_KIND=minio           # must match the store you started
+```
+
+**3 — Run the V1 integration tests** (throughput + H1 bytes + tap fidelity):
+
+```bash
+pytest -m minio -v
+```
+
+**4 — Just the throughput test (I1), watching the numbers** — `-s` un-captures
+stdout so the measured files/s + MiB/s print:
+
+```bash
+pytest -m minio -k throughput -s
+```
+
+The floor is opt-in and shared with V2 (same `run` command); set it to enforce a
+rate on a store/host you trust — calibrated lower for V1 than V2, since V1 moves
+whole files (leave it unset ⇒ accounting-only, so CI never flakes):
+
+```bash
+BENCH_MIN_RUN_FILES_PER_S=50 pytest -m minio -k throughput
+# Windows PowerShell:  $env:BENCH_MIN_RUN_FILES_PER_S=50; pytest -m minio -k throughput
+```
+
+**5 — Verify the V1-vs-V2 story by hand (what I1 + I2 automate)** — seed once,
+run both variants, read the throughput and the ~17× bytes gap straight off
+stdout:
+
+```bash
+make seed TIER=medium BUCKET=bronze
+python -m rgw_ingest_bench run --variant v1 --repeat 2 --tier medium --bucket bronze --json \
+       | jq '{bytes, mib_per_s_median, files_per_s_median}'
+python -m rgw_ingest_bench run --variant v2 --repeat 2 --tier medium --bucket bronze --json \
+       | jq '{bytes, mib_per_s_median, files_per_s_median}'
+# v1.bytes ≈ 17 × v2.bytes for an identical content_hash — H1, by hand (CI uses a smaller tier)
+```
+
+**6 — (RGW only, optional) third opinion on bytes moved** — the server's own
+tally, independent of both client taps (§5.4):
+
+```bash
+make rgw-stats                       # radosgw-admin bucket stats, before…
+python -m rgw_ingest_bench run --variant v1 --repeat 1 --tier medium --json
+make rgw-stats                       # …and after: Δ bytes_sent ≈ v1.bytes
+```
+
+**7 — Tear down:**
+
+```bash
+make minio-down                      # or make rgw-down  (compose down -v: full reset)
+```
+
+Notes:
+
+- No new coverage surface from the CLI: `run --json` is PR 3 code (its branch is
+  covered in-process by PR 3's T12). PR 4's new lines — `v1_buffered.py`,
+  `taps.py`, the canary — are covered by the moto unit suite (§6.1); the
+  live-store tests add none and run outside the `--cov-fail-under=100` gate.
+- moto exercises s3fs's *client-side* readahead, so the byte counters are
+  unit-tested (T2/T6); the live store is only needed for real Range fidelity
+  (I3) and for throughput / MiB-s wall time (I1). Both matter — hence both tiers.
+- Every V1 repetition cross-checks its two taps (`audit == wire`); a mismatch
+  marks the run invalid with both numbers named — the §5.2 defense against
+  silent s3fs drift, active in the integration job too.
 
 ## 7. CLI & recorded output
 
@@ -245,6 +369,14 @@ counters:  bytes_fetched_audit, bytes_fetched_wire, get_count, get_count_wire, h
 params:    s3fs_block_size, s3fs_cache_type, fetches_per_file_mean,
            fetch_bytes_mean, fetch_bytes_max
 ```
+
+**Throughput surfaces through PR 3's `run --json`, unchanged.** The medians
+summary (`files`, `bytes`, `mib_per_s_median`, `files_per_s_median`, …) already
+exists; for V1 its `bytes` is the `bytes_fetched_audit` total, so the readahead
+shows up directly in the `mib_per_s_median` an operator reads — no new flag, and
+the §6.2 I1 test parses the same object. The `BENCH_MIN_RUN_FILES_PER_S` floor
+(PR 1 §7.2 `BENCH_MIN_<command>_<rate>` convention) applies to `run` whatever the
+variant.
 
 `--dump-samples` (PR 2 flag) additionally writes the full `FetchRecord` list
 as JSONL beside the results file — raw material for the PR 6 bytes figure.
@@ -260,8 +392,12 @@ as JSONL beside the results file — raw material for the PR 6 bytes figure.
       delta ≈ client-side bytes (± protocol overhead) recorded once manually.
 - [ ] Canary green on the pinned s3fs; deliberately bumping s3fs a major
       version locally shows the canary failing informatively (screenshot in PR).
-- [ ] 100 % line/branch on new code; no new deps; no model changes
-      (PR 2/3 JSONL rows still parse).
+- [ ] Fast gate green without Docker (`pytest -m "not minio and not netem"`,
+      100 % line/branch on new code); `pytest -m minio` green in CI — including
+      I1 `test_run_v1_throughput_cli` (v1 `run --json` throughput self-consistent,
+      reconciles with `results/runs.jsonl`) and I2 (V1 moves ~17× V2's bytes for
+      an identical `content_hash`, §4). No new deps; no model changes (PR 2/3
+      JSONL rows still parse).
 
 ## 9. Open questions
 

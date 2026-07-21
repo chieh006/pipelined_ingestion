@@ -248,9 +248,18 @@ overnight" made checkable before committing an evening to it.
 
 ## 6. Test plan
 
-pytest + fixtures; no store needed anywhere — sweep tests fake the
-subprocess boundary, report tests run on synthetic JSONL. matplotlib under
-Agg. 100 % line/branch on new code.
+pytest + fixtures. The **unit** suite (§6.1) needs no store anywhere — sweep
+tests fake the subprocess boundary, report tests run on synthetic JSONL,
+matplotlib under Agg — and it carries the 100 % line/branch coverage gate. The
+**integration** suite (§6.2) runs the real `sweep → run → report` chain against
+a live store, where campaign throughput is verified end-to-end through the CLI;
+§6.3 is the run walkthrough. `sweep` executes PR 3/5 `run` subprocesses, so it
+inherits `run --json`, the §5.1 row schema, the `minio` / `netem` markers
+(PR 2), and the `BENCH_MIN_RUN_FILES_PER_S` floor (PR 3) unchanged — no new
+throughput surface, no new env var. The fast gate is
+`-m "not minio and not netem"`.
+
+### 6.1 Unit test matrix
 
 | # | Test | Asserts (incl. unhappy paths) |
 |---|---|---|
@@ -267,6 +276,127 @@ Agg. 100 % line/branch on new code.
 | T11 | `test_key_contract` | shared constants module matches the names PR 2–5 actually emit (fixture rows generated via the real `RunResult` model) — the §5.1 table enforced |
 | T12 | `test_dry_run` | prints full run list + ETA, executes nothing (runner never called) |
 
+### 6.2 Integration tests (the real sweep → run → report chain)
+
+The unit tests fake the subprocess boundary (T3) and feed `report` synthetic
+JSONL (T7–T10) — fast, hermetic, no store. What they cannot prove is that the
+campaign layer is faithful *end to end*: that `sweep` really drives the PR 3/5
+`run` CLI against a live store, that the throughput `report` prints is the same
+number those runs measured, and that the §4.3 figures render from real rows.
+These tests drive the **real CLI** — `sweep` and `report` as subprocesses
+(`sys.executable -m rgw_ingest_bench …`) — against a **live** store (MinIO for CI
+via `make minio-up`, RGW for headline numbers via `make rgw-up`), pointed at it
+with the `BENCH_S3_*` env. Marked `@pytest.mark.minio` (I2 is
+`@pytest.mark.netem`); run in CI's integration job, skipped locally by default.
+
+Compatibility: `sweep` adds no throughput surface of its own — each cell is a PR
+3/5 `run` subprocess, so `run --json`, the `RunResult` JSONL schema (§5.1), and
+the `BENCH_MIN_RUN_FILES_PER_S` floor all apply unchanged (subprocesses inherit
+the env var, so a floor set once guards every cell). `report` only *reads* rows.
+
+| # | Test | Asserts |
+|---|---|---|
+| I1 | `test_sweep_report_throughput_cli` | **the campaign throughput capstone.** Seed a small corpus; `sweep --anchor tier=small,schema=scalar --axis variant=v2,v3 --repeat 5` against the live store (real per-round `run --repeat 1` subprocesses); then `report <results> --figures <dir> --scorecard`. Assert the chain exits 0 and report's per-cell **median files/s equals `numpy.median` of that cell's JSONL rows' `files_per_s`** (report is a faithful aggregator — the throughput it prints is exactly the rows' own accounting, the same `files_per_s` a `run --json` surfaces); each row's `files_per_s == files/wall_s`; figure (a) bytes/file + scorecard H1 render from the real rows (V2 ≈ V3 ≈ 64 KiB band); warmup rows excluded, per-cell valid-rep count printed. Throughput verified through the full CLI, not a fixture. |
+| I2 | `test_sweep_report_knee_netem` | **the knee (figure b / H3), CLI-verified.** Under `scripts/netem.sh set <d>` (so concurrency has latency to hide), `sweep --anchor tier=small,rtt=<d>,schema=scalar --axis n-inflight=1,4,16,64` for v3 → `report`. Assert files/s rises then plateaus with N (a detectable knee `N* > 1`), figure (b) renders non-empty PNG+SVG, and the scorecard reports H3 with `N*` and the p99-past-knee slope. Marked `@pytest.mark.netem`, **skipped unless** `BENCH_NETEM=1` and the process can `sudo tc`; on loopback the curve is legitimately flat (§6/PR 5 loop-bound regime) and the scorecard says so — so the test asserts *a verdict is produced* always, and the knee shape only when netem is active. |
+| I3 | `test_sweep_resume_cli` | **overnight robustness, end to end.** Start a multi-cell `sweep` against the live store, interrupt it after ≥1 cell completes (detected via the results JSONL, not a timer), then rerun with `--resume`: assert only the missing (cell, round) pairs execute (completed rows are not duplicated), the RTT guard re-verifies each resumed cell, and a final `report` over the union matches an uninterrupted run's stats. The §3.5 resume claim proven against real subprocesses and real rows, not T6's pre-seeded fixture. |
+
+**No new throughput contract.** PR 6 verifies throughput by *reconciliation*, not
+a new floor: `report`'s numbers must equal what the underlying rows (and the
+`run --json` summaries that printed them, PR 3 §7) already reported, so the
+campaign cannot silently disagree with the per-run figure an operator checks by
+hand. The `BENCH_MIN_RUN_FILES_PER_S` floor (PR 1 §7.2 `BENCH_MIN_<command>_<rate>`
+convention) still applies to every `run` a sweep spawns — set it in the
+environment and the whole campaign is floored. The real knee-vs-N curve is I2 +
+figure (b); a single floor was never PR 6's job.
+
+### 6.3 Running the integration tests (walkthrough)
+
+The unit suite (§6.1) needs only an install — no store, no Docker. The
+integration tests run the real campaign chain, so they need a live store (and I2
+needs `tc`). From the harness root:
+
+```bash
+pip install -e ".[dev,report]"       # adds matplotlib (Agg) for the report figures
+```
+
+**1 — Fast gate (no Docker, no store): unit tests + coverage:**
+
+```bash
+pytest -m "not minio and not netem" \
+       --cov=rgw_ingest_bench --cov-branch --cov-fail-under=100
+```
+
+**2 — Bring up a live store and point the client at it:**
+
+```bash
+make minio-up                        # or: make rgw-up   (headline numbers)
+export BENCH_S3_ENDPOINT=http://localhost:9000
+export BENCH_S3_ACCESS_KEY=bench BENCH_S3_SECRET_KEY=bench-secret
+export BENCH_S3_KIND=minio           # must match the store you started
+```
+
+**3 — Run the campaign integration tests** (I1 capstone, I3 resume; the netem
+knee I2 is step 6):
+
+```bash
+pytest -m minio -v
+```
+
+**4 — Verify campaign throughput by hand (what I1 automates)** — run a tiny
+sweep, then report it; the scorecard's files/s per cell is exactly the median of
+that cell's run rows (report re-derives nothing an operator can't check):
+
+```bash
+make seed TIER=small BUCKET=bronze
+python -m rgw_ingest_bench sweep --anchor tier=small,schema=scalar \
+       --axis variant=v2,v3 --repeat 5 --results results/demo.jsonl
+python -m rgw_ingest_bench report results/demo.jsonl --figures out/figures/ --scorecard
+# each row's files_per_s == files / wall_s (the same value `run --json` prints);
+# report's per-cell figure == the median of those rows.
+```
+
+**5 — Floor the whole campaign (optional)** — the per-run floor is inherited by
+every `sweep` subprocess via the environment (leave it unset ⇒ accounting-only,
+so CI never flakes):
+
+```bash
+BENCH_MIN_RUN_FILES_PER_S=200 python -m rgw_ingest_bench sweep --preset mvp --dry-run
+# --dry-run first to see the plan + ETA; every real cell's `run` then enforces the floor
+```
+
+**6 — The netem knee (I2), figure (b)'s headline** — needs root for `tc`, store
+from step 2 still up:
+
+```bash
+BENCH_NETEM=1 pytest -m netem -k knee
+# …or by hand:
+make netem-set DELAY=1ms
+python -m rgw_ingest_bench sweep --anchor tier=small,rtt=1ms,schema=scalar \
+       --axis n-inflight=1,4,16,64 --repeat 5 --results results/knee.jsonl
+python -m rgw_ingest_bench report results/knee.jsonl --figures out/figures/ --scorecard
+make netem-clear
+# figure (b): files/s rises then plateaus; scorecard H3 reports N*
+```
+
+**7 — Tear down:**
+
+```bash
+make netem-clear ; make minio-down   # or make rgw-down  (compose down -v: full reset)
+```
+
+Notes:
+
+- No new coverage surface: `sweep`/`report` line coverage is carried by the §6.1
+  unit tests (fake runner, synthetic JSONL); the live-store tests exercise the
+  real chain and run outside the `--cov-fail-under=100` gate. `run --json`
+  itself is PR 3 code (covered by PR 3's T12).
+- The integration sweep uses a *small* tier and few cells so a live pass is
+  minutes, not the overnight `--preset mvp` campaign; the §7 acceptance
+  checklist covers the full preset once on the WSL2 box.
+- `report` needs the `[report]` extra (matplotlib); it is optional at runtime so
+  benchmark-box installs stay lean (§2). The integration job installs it; a bare
+  install skips figure rendering with a logged warning, not a crash.
+
 ## 7. Acceptance checklist (PR review gate)
 
 - [ ] `sweep --preset mvp --dry-run` prints the §8.1 campaign (correct cells,
@@ -278,8 +408,13 @@ Agg. 100 % line/branch on new code.
 - [ ] Figure (b) shows a knee (or the scorecard says why not — e.g. RTT≈0
       loop-bound regime); either way the pipeline of evidence works.
 - [ ] `results/` layout (JSONL + figures) committed as parent §12 specifies.
-- [ ] 100 % line/branch on new code; `[report]` extra optional (runtime
-      install works without matplotlib); no pandas anywhere.
+- [ ] Fast gate green without Docker (`pytest -m "not minio and not netem"`,
+      100 % line/branch on new code); `pytest -m minio` green in CI — including
+      I1 `test_sweep_report_throughput_cli` (report's per-cell files/s reconciles
+      with the underlying `run` rows' `files_per_s`) and I3 resume; the netem
+      knee I2 run once under `BENCH_NETEM=1`.
+- [ ] `[report]` extra optional (runtime install works without matplotlib); no
+      pandas anywhere.
 
 ## 8. Open questions
 

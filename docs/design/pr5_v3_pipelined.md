@@ -227,13 +227,32 @@ run --variant v3 [--n-inflight 128] [--queue-bound 1000] [--no-manifest]
   RTT≈2 ms, `medium`, scalar → ~10k files in low single-digit seconds;
   content hash equal to V1/V2's on the same corpus.
 
+**Throughput surfaces through PR 3's `run --json`, unchanged.** V3 adds knob
+flags but no new output surface: the medians summary (`files`,
+`files_per_s_median`, `mib_per_s_median`, `wall_s_median`, …) is what an operator
+reads to see the concurrency speedup, and the §8.2 I1/I2 tests parse the same
+object. `bytes ≈` V2's (both ranged, ~64 KiB/file) — V3's story is *files/s*, not
+bytes — so the shared `BENCH_MIN_RUN_FILES_PER_S` floor (PR 1 §7.2
+`BENCH_MIN_<command>_<rate>` convention) is exactly the right axis, just set
+higher than V2 since V3 is faster. `inflight_peak` / `inflight_p95` in `params`
+(§6) let a run also report the achieved concurrency behind that speed.
+
 ## 8. Test plan
 
 pytest + `pytest-asyncio`; moto **server** (PR 2 dep) as the async-capable
 store — aiobotocore speaks real HTTP to it; MinIO marks for fidelity. Every
 async test wrapped in `asyncio.wait_for` (no CI hangs). 100 % line/branch on
 new code. The named suites parent §12 asks for — backpressure, sentinel
-shutdown, fetch-byte counters — are T3/T4/T2.
+shutdown, fetch-byte counters — are T3/T4/T2. The plan splits into fast,
+moto-server **unit tests** (§8.1, which carry the 100 % coverage gate),
+**integration tests** against a live store (§8.2, where V3's concurrency
+throughput is verified through the CLI), and a **run walkthrough** (§8.3).
+`run --variant v3` reuses PR 3's `run --json` summary and the shared
+`BENCH_MIN_RUN_FILES_PER_S` floor unchanged — V3 is a registry entry plus knob
+flags, not a new command — and the `minio` / `netem` markers registered by PR 2;
+the fast gate is `-m "not minio and not netem"`.
+
+### 8.1 Unit test matrix
 
 | # | Test | Asserts (incl. unhappy paths) |
 |---|---|---|
@@ -252,7 +271,138 @@ shutdown, fetch-byte counters — are T3/T4/T2.
 | T13 | `test_determinism_across_n` | same corpus, `n_inflight ∈ {1, 8, 64}` → identical content hash (concurrency must not change silver) |
 | T14 | `test_writer_offload_equivalence` | `--writer-offload` on/off → identical hash; counters consistent (lock-guarded CounterSet exercised from the flush thread) |
 | T15 | `test_full_schema_path` | `full` mode small run: arrays intact through the pipeline, gate passes — the code path the V4-trigger campaign will use |
-| T16 | `@pytest.mark.minio` | T1–T3 against live MinIO (real ranged-GET + HTTP semantics under concurrency) |
+### 8.2 Integration tests (live object store)
+
+The unit suite runs against **moto server** (async, real HTTP in-process): it
+proves the pipeline is *correct* — gate, counters, backpressure, shutdown — but
+moto is loopback-in-a-process, so it can show neither real *throughput* nor the
+latency-hiding that is V3's entire reason to exist. These tests drive the **real
+CLI** (`sys.executable -m rgw_ingest_bench …` as a subprocess) against a **live**
+store (MinIO for CI via `make minio-up`, RGW for headline numbers via
+`make rgw-up`), pointed at it with the `BENCH_S3_*` env. Marked
+`@pytest.mark.minio` (I2 is `@pytest.mark.netem`); run in CI's integration job,
+skipped locally by default. They reuse PR 3's `run --json` summary and the shared
+`BENCH_MIN_RUN_FILES_PER_S` floor unchanged — `run --variant v3` is a registry
+entry plus knob flags, not a new command.
+
+| # | Test | Asserts |
+|---|---|---|
+| I1 | `test_run_v3_throughput_cli` | **the CLI throughput check.** Seed a corpus, then `run --variant v3 --n-inflight 32 --schema scalar --repeat 2 --json` as a subprocess; parse PR 3's summary `{files, bytes, gate_passed, wall_s_median, files_per_s_median, mib_per_s_median, …}`. Assert `gate_passed` and `files == n_files`; `files_per_s_median == files/wall_s_median` and `mib_per_s_median == bytes/wall_s_median/2**20` within 1 % (**reported throughput is accurate**); `bytes ≈ 65 536·n` (V3 is ranged like V2, not V1's whole-file readahead); the matching `results/runs.jsonl` row has `params.inflight_peak > 1` (concurrency actually happened on a real socket — the §6 proof); reuse the **opt-in** `BENCH_MIN_RUN_FILES_PER_S` floor (unset ⇒ accounting-only, so CI never flakes; set *higher* than V2, since V3 is the fast one); the stdout medians reconcile with those rows. |
+| I2 | `test_v3_vs_v2_speedup_netem` | **the H2/H3 headline, CLI-verified.** Under `scripts/netem.sh set <d>` (so there is latency to hide), `run --variant v3 --n-inflight 64` and `run --variant v2` over the same seeded bucket; assert **identical `content_hash`** (V3 == V2 == V1 silver) *and* `files_per_s_median(v3) ≥ 3× files_per_s_median(v2)` — the concurrency speedup, asserted as a conservative multiple so it can't flake but a collapsed pipeline trips. Marked `@pytest.mark.netem`, **skipped unless** `BENCH_NETEM=1` and the process can `sudo tc` (root + Linux); on loopback (RTT≈0) the speedup legitimately vanishes (§6 loop-bound regime), which is *why* it is netem-gated, not run bare. |
+| I3 | `test_v3_backpressure_cli` | **H4 via the CLI.** `run --variant v3 --queue-bound 100 --writer-delay-ms 5 --dump-samples --json` on a few hundred files; from the dumped sampler JSONL assert `queue_depth ≤ queue_bound` at every sample and `rss_mib` flat (no growth ∝ files) — bounded memory under a deliberately throttled writer, read straight from a real run. The §1.1 backpressure demo, mechanized. |
+| I4 | `test_v3_fidelity_minio` | the former T16 against **real HTTP under concurrency**: cross-variant hash == V1/V2 (T1); manifest-mode counters `head_count == 0`, `get_count == 2n`, `bytes == 65 536·n` (T2); backpressure holds (T3) — on genuinely concurrent ranged GETs a real server answered, not moto's approximation. Also confirms the §6.5 pool sizing on a live client (`max_pool == n_inflight + 8`). |
+
+**Throughput contract — inherited, not re-declared.** V3 adds knob flags
+(`--n-inflight`, `--queue-bound`, …) but no new *output* surface: `run --json`
+(PR 3 §7) already emits the medians summary I1/I2 parse, and V3's speed shows up
+in the same `files_per_s_median` an operator reads. The floor stays the shared
+`BENCH_MIN_RUN_FILES_PER_S` (PR 1 §7.2 `BENCH_MIN_<command>_<rate>` convention) —
+files/s is exactly V3's axis (unlike V1, where it was a weak proxy for a
+bytes-moved story). V3's *distinctive* verification is the N-scaling speedup (I2)
+and achieved concurrency (`inflight_peak`, I1); the real knee-vs-N curve is
+PR 6's sweep, not a single floor here.
+
+### 8.3 Running the integration tests (walkthrough)
+
+The unit suite needs only an install (`moto[server]` comes with the dev extra);
+the integration tests need a live store, and I2 additionally needs `tc`. From
+the harness root:
+
+```bash
+pip install -e ".[dev]"              # moto[server], pytest-asyncio, pyarrow, pytest-cov, …
+```
+
+**1 — Fast gate (no Docker, no store): async unit + moto-server, with coverage:**
+
+```bash
+pytest -m "not minio and not netem" \
+       --cov=rgw_ingest_bench --cov-branch --cov-fail-under=100
+```
+
+**2 — Bring up a live store and point the client at it:**
+
+```bash
+make minio-up                        # or: make rgw-up   (headline numbers + rgw-stats)
+export BENCH_S3_ENDPOINT=http://localhost:9000
+export BENCH_S3_ACCESS_KEY=bench BENCH_S3_SECRET_KEY=bench-secret
+export BENCH_S3_KIND=minio           # must match the store you started
+```
+
+**3 — Run the V3 integration tests** (I1 throughput, I3 backpressure, I4
+fidelity; the netem speedup I2 is step 6):
+
+```bash
+pytest -m minio -v
+```
+
+**4 — Just the throughput test (I1), watching the numbers** — `-s` un-captures
+stdout so the measured files/s + MiB/s print (`inflight_peak` lands in the
+`results/runs.jsonl` row):
+
+```bash
+pytest -m minio -k throughput -s
+```
+
+The floor is opt-in and shared across variants (same `run` command); for V3 set
+it *higher* than V2 — concurrency makes V3 the fast one (leave it unset ⇒
+accounting-only, so CI never flakes):
+
+```bash
+BENCH_MIN_RUN_FILES_PER_S=500 pytest -m minio -k throughput
+# Windows PowerShell:  $env:BENCH_MIN_RUN_FILES_PER_S=500; pytest -m minio -k throughput
+```
+
+**5 — Verify the V3-vs-V2 speed by hand (what I1 + I2 automate)** — seed once,
+run both under netem to see the real gap, read files/s off stdout:
+
+```bash
+make seed TIER=medium BUCKET=bronze
+make netem-set DELAY=1ms
+python -m rgw_ingest_bench run --variant v3 --n-inflight 64 --repeat 2 --tier medium --bucket bronze --json \
+       | jq '{files_per_s_median, mib_per_s_median}'
+python -m rgw_ingest_bench run --variant v2 --repeat 2 --tier medium --bucket bronze --json \
+       | jq '{files_per_s_median}'
+make netem-clear
+# v3.files_per_s ≫ v2.files_per_s at RTT≈2 ms, identical content_hash — H2, by hand.
+# (achieved concurrency is params.inflight_peak in results/runs.jsonl)
+```
+
+**6 — The netem speedup test (I2), the H2/H3 headline** — needs root for `tc`,
+and the live store from step 2 still up:
+
+```bash
+BENCH_NETEM=1 pytest -m netem -k speedup
+```
+
+**7 — See the H4 backpressure shape (I3) by hand:**
+
+```bash
+python -m rgw_ingest_bench run --variant v3 --queue-bound 100 --writer-delay-ms 5 \
+       --tier small --dump-samples --json
+# then inspect the *-samples.jsonl: queue_depth pinned ≤ 100, rss_mib flat
+```
+
+**8 — Tear down:**
+
+```bash
+make netem-clear ; make minio-down   # or make rgw-down  (compose down -v: full reset)
+```
+
+Notes:
+
+- No new coverage surface from the CLI: `run --json` is PR 3 code (its branch is
+  covered in-process by PR 3's T12). PR 5's new lines — `v3_pipelined.py`, the
+  fetcher/writer tasks, the inflight computation — are covered by the async
+  moto-server suite (§8.1); the live-store tests add none and run outside the
+  `--cov-fail-under=100` gate.
+- moto server (async, real HTTP in-process) is enough for *correctness* — gate,
+  counters, backpressure, shutdown (T1–T15); the live store is only needed for
+  real *throughput* (I1), the latency-hidden speedup (I2, netem), and real
+  concurrent Range fidelity (I4).
+- V3 rows carry `inflight_peak`/`inflight_p95`; if `inflight_peak ≤ 10 <
+  n_inflight` the run is invalid (§6.5 default-pool cap) — that hard check runs
+  in the integration job too, so a silently capped pool fails loudly, not
+  quietly.
 
 ## 9. Acceptance checklist (PR review gate)
 
@@ -268,8 +418,14 @@ shutdown, fetch-byte counters — are T3/T4/T2.
       demonstrated locally.
 - [ ] `rgw-stats` byte delta ≈ client counters for one V3 run (third-opinion
       check, PR 4 tooling).
-- [ ] 100 % line/branch on new code; PR 1–4 suites untouched and green;
-      uvloop remains optional (CI runs without it).
+- [ ] Fast gate green without Docker (`pytest -m "not minio and not netem"`,
+      100 % line/branch on new code, `moto[server]` backend); `pytest -m minio`
+      green in CI — including I1 `test_run_v3_throughput_cli` (v3 `run --json`
+      throughput self-consistent, `inflight_peak > 1`, reconciles with
+      `results/runs.jsonl`) and I4 fidelity; the netem speedup I2 (H2) run once
+      under `BENCH_NETEM=1`.
+- [ ] PR 1–4 suites untouched and green; uvloop remains optional (CI runs
+      without it).
 
 ## 10. Open questions
 
