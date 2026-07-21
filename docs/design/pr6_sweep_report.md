@@ -20,10 +20,10 @@ risk, different diffs.
 ### 1.1 Goal
 
 ```bash
-python -m rgw_ingest_bench sweep --preset mvp            # §8.1 campaign, resumable
-python -m rgw_ingest_bench sweep --anchor "tier=medium,rtt=2ms,schema=scalar" \
-                                 --axis n-inflight=1,8,32,64,128,256,512
-python -m rgw_ingest_bench report results/*.jsonl --figures out/figures/ --scorecard
+uv run python -m rgw_ingest_bench sweep --preset mvp            # §8.1 campaign, resumable
+uv run python -m rgw_ingest_bench sweep --anchor "tier=medium,rtt=2ms,schema=scalar" \
+                                        --axis n-inflight=1,8,32,64,128,256,512
+uv run python -m rgw_ingest_bench report results/*.jsonl --figures out/figures/ --scorecard
 ```
 
 Deliverables:
@@ -316,13 +316,13 @@ integration tests run the real campaign chain, so they need a live store (and I2
 needs `tc`). From the harness root:
 
 ```bash
-pip install -e ".[dev,report]"       # adds matplotlib (Agg) for the report figures
+uv sync --extra dev --extra report   # adds matplotlib (Agg) for the report figures
 ```
 
 **1 — Fast gate (no Docker, no store): unit tests + coverage:**
 
 ```bash
-pytest -m "not minio and not netem" \
+uv run pytest -m "not minio and not netem" \
        --cov=rgw_ingest_bench --cov-branch --cov-fail-under=100
 ```
 
@@ -339,7 +339,7 @@ export BENCH_S3_KIND=minio           # must match the store you started
 knee I2 is step 6):
 
 ```bash
-pytest -m minio -v
+uv run pytest -m minio -v
 ```
 
 **4 — Verify campaign throughput by hand (what I1 automates)** — run a tiny
@@ -348,9 +348,9 @@ that cell's run rows (report re-derives nothing an operator can't check):
 
 ```bash
 make seed TIER=small BUCKET=bronze
-python -m rgw_ingest_bench sweep --anchor tier=small,schema=scalar \
+uv run python -m rgw_ingest_bench sweep --anchor tier=small,schema=scalar \
        --axis variant=v2,v3 --repeat 5 --results results/demo.jsonl
-python -m rgw_ingest_bench report results/demo.jsonl --figures out/figures/ --scorecard
+uv run python -m rgw_ingest_bench report results/demo.jsonl --figures out/figures/ --scorecard
 # each row's files_per_s == files / wall_s (the same value `run --json` prints);
 # report's per-cell figure == the median of those rows.
 ```
@@ -360,7 +360,7 @@ every `sweep` subprocess via the environment (leave it unset ⇒ accounting-only
 so CI never flakes):
 
 ```bash
-BENCH_MIN_RUN_FILES_PER_S=200 python -m rgw_ingest_bench sweep --preset mvp --dry-run
+BENCH_MIN_RUN_FILES_PER_S=200 uv run python -m rgw_ingest_bench sweep --preset mvp --dry-run
 # --dry-run first to see the plan + ETA; every real cell's `run` then enforces the floor
 ```
 
@@ -368,12 +368,12 @@ BENCH_MIN_RUN_FILES_PER_S=200 python -m rgw_ingest_bench sweep --preset mvp --dr
 from step 2 still up:
 
 ```bash
-BENCH_NETEM=1 pytest -m netem -k knee
+BENCH_NETEM=1 uv run pytest -m netem -k knee
 # …or by hand:
 make netem-set DELAY=1ms
-python -m rgw_ingest_bench sweep --anchor tier=small,rtt=1ms,schema=scalar \
+uv run python -m rgw_ingest_bench sweep --anchor tier=small,rtt=1ms,schema=scalar \
        --axis n-inflight=1,4,16,64 --repeat 5 --results results/knee.jsonl
-python -m rgw_ingest_bench report results/knee.jsonl --figures out/figures/ --scorecard
+uv run python -m rgw_ingest_bench report results/knee.jsonl --figures out/figures/ --scorecard
 make netem-clear
 # figure (b): files/s rises then plateaus; scorecard H3 reports N*
 ```

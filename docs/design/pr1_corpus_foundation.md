@@ -25,7 +25,7 @@ Deliver the data layer every later PR stands on:
    file_id`), later consumed by V3's manifest mode and the §7.2 correctness gate (I1).
 5. **`parse.py`** — header/footer parsing (`np.frombuffer` at fixed offsets),
    footer-presence arithmetic, and the pixel-pattern guard.
-6. **A minimal CLI**: `python -m rgw_ingest_bench generate` (local disk only).
+6. **A minimal CLI**: `uv run python -m rgw_ingest_bench generate` (local disk only).
 7. **Tests** proving generator ↔ parser roundtrip, footer arithmetic, pattern
    guard, determinism, and manifest integrity — 100 % line/branch coverage on
    the new code.
@@ -55,6 +55,7 @@ tracked outside this doc — the scaffold is identical either way):
 ```
 rgw-ingest-bench/
   pyproject.toml
+  uv.lock                         # uv-managed lockfile (pinned, committed)
   README.md                       # one paragraph + generate quick-start
   src/rgw_ingest_bench/
     __init__.py                   # __version__
@@ -74,10 +75,14 @@ rgw-ingest-bench/
     test_integration.py           # @pytest.mark.integration: CLI end-to-end + throughput
 ```
 
+Package management is **`uv`** throughout (project standard): `uv` owns the
+virtualenv, resolves and pins deps into a committed `uv.lock`, and runs every
+command via `uv run`. `pip`/`python -m venv` are not used.
+
 `pyproject.toml`:
 
 - Build backend: `hatchling`; `src/` layout; `requires-python = ">=3.12"`.
-- Runtime deps (pinned, parent §4): `numpy`, `pydantic>=2`, `polars`.
+- Runtime deps (parent §4), pinned by `uv.lock`: `numpy`, `pydantic>=2`, `polars`.
   (`pyarrow`, `s3fs`/`aiobotocore`, `uvloop` are **not** needed until PR 2/5 —
   do not add them here; every dep added now is a dep CI installs forever.)
 - Dev deps: `pytest`, `pytest-cov`, `psutil` (dev-only; backs the §7.2 RSS
@@ -400,33 +405,31 @@ it bounds — `BENCH_MIN_GENERATE_MIB_PER_S` / `BENCH_MIN_SEED_MIB_PER_S` bound
 
 ### 7.3 Running the tests (walkthrough)
 
-From the harness root (the directory holding `pyproject.toml`), in a fresh
-virtualenv:
+From the harness root (the directory holding `pyproject.toml`), `uv` creates the
+virtualenv and installs the project (editable) plus the dev extra in one step:
 
 ```bash
-python -m venv .venv
-. .venv/bin/activate                 # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"              # pulls in pytest-cov + psutil
+uv sync --extra dev                  # creates .venv, installs project + pytest-cov + psutil
 ```
 
 **1 — Everyday loop: fast unit suite + coverage gate** (no subprocess, <2 s):
 
 ```bash
-pytest -m "not integration" --cov=rgw_ingest_bench --cov-branch --cov-fail-under=100
+uv run pytest -m "not integration" --cov=rgw_ingest_bench --cov-branch --cov-fail-under=100
 ```
 
 **2 — The integration tests** (I1–I4; each shells out to a real
 `rgw_ingest_bench` process and writes only under pytest's `tmp_path`):
 
 ```bash
-pytest -m integration -v
+uv run pytest -m integration -v
 ```
 
 **3 — Just the throughput test (I2), watching the number** — `-s` un-captures
 stdout so the measured rate prints:
 
 ```bash
-pytest -m integration -k throughput -s
+uv run pytest -m integration -k throughput -s
 ```
 
 I2 always asserts the CLI's throughput *accounting* is correct; the absolute
@@ -435,24 +438,24 @@ machine you trust (leave it unset ⇒ accounting-only, so CI never flakes on
 hardware variance); a good starting value on local disk is ≈ 20 MiB/s:
 
 ```bash
-BENCH_MIN_GENERATE_MIB_PER_S=50 pytest -m integration -k throughput
-# Windows PowerShell:  $env:BENCH_MIN_GENERATE_MIB_PER_S=50; pytest -m integration -k throughput
+BENCH_MIN_GENERATE_MIB_PER_S=50 uv run pytest -m integration -k throughput
+# Windows PowerShell:  $env:BENCH_MIN_GENERATE_MIB_PER_S=50; uv run pytest -m integration -k throughput
 ```
 
 **4 — Verify throughput by hand (exactly what I2 automates)** — run the CLI with
 `--json` and read the rate straight off stdout:
 
 ```bash
-python -m rgw_ingest_bench generate --tier small --out ./corpus --json
+uv run python -m rgw_ingest_bench generate --tier small --out ./corpus --json
 # {"files": 10000, "bytes": 1719664640, "elapsed_s": 6.7, "mib_per_s": 244.8, "files_per_s": 1492.5}
 
-python -m rgw_ingest_bench generate --tier small --out ./corpus --json | jq .mib_per_s
+uv run python -m rgw_ingest_bench generate --tier small --out ./corpus --json | jq .mib_per_s
 ```
 
 **5 — Everything at once** (unit + integration), e.g. a pre-push check:
 
 ```bash
-pytest
+uv run pytest
 ```
 
 Notes:
@@ -462,19 +465,20 @@ Notes:
   gate unmeetable. CI runs the two selections as separate jobs.
 - I3 (`test_cli_memory_streaming`) needs `psutil` and `skip`s automatically if
   it is absent, so the suite still passes on a minimal environment.
-- Editing source needs no reinstall — `pip install -e` is editable and the
-  integration tests launch the package via `sys.executable -m rgw_ingest_bench`,
-  so they pick up live code. Reinstall only when entry points or deps change.
+- Editing source needs no reinstall — `uv sync` installs the project editable
+  and the integration tests launch the package via
+  `sys.executable -m rgw_ingest_bench`, so they pick up live code. Re-run
+  `uv sync` only when entry points or deps change.
 
 ---
 
 ## 8. CLI (`generate` only)
 
 ```bash
-python -m rgw_ingest_bench generate --tier medium --out ./corpus [--seed 42]
-python -m rgw_ingest_bench generate --n-files 100 --width 256 --height 256 \
-                                    --channels 1 --out ./corpus   # explicit spec
-python -m rgw_ingest_bench generate --tier small --out ./corpus --json  # machine-readable stats
+uv run python -m rgw_ingest_bench generate --tier medium --out ./corpus [--seed 42]
+uv run python -m rgw_ingest_bench generate --n-files 100 --width 256 --height 256 \
+                                           --channels 1 --out ./corpus   # explicit spec
+uv run python -m rgw_ingest_bench generate --tier small --out ./corpus --json  # machine-readable stats
 ```
 
 - `argparse` subcommands; `--tier` and the explicit-spec flags are mutually
@@ -495,9 +499,9 @@ python -m rgw_ingest_bench generate --tier small --out ./corpus --json  # machin
 
 ## 9. Acceptance checklist (PR review gate)
 
-- [ ] `pip install -e .[dev] && pytest` passes on a clean machine, no Docker
-      (fast gate `pytest -m "not integration" --cov …` at 100 %; full pass
-      `pytest -m integration` green).
+- [ ] `uv sync --extra dev && uv run pytest` passes on a clean machine, no Docker
+      (fast gate `uv run pytest -m "not integration" --cov …` at 100 %; full pass
+      `uv run pytest -m integration` green).
 - [ ] `generate --tier small` on a laptop: ~1.6 GiB corpus, flat memory
       profile (spot-check RSS, now covered by I3), manifest line count =
       10 000, and the printed throughput figure is non-trivial (I2 verifies its

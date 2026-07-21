@@ -19,8 +19,8 @@ After this PR merges, the following works end-to-end on the WSL2 box:
 
 ```bash
 make rgw-up                                          # Ceph RGW container, healthy
-python -m rgw_ingest_bench seed --tier medium --bucket bronze --seed 42
-python -m rgw_ingest_bench rtt-probe                 # measured RTT to endpoint
+uv run python -m rgw_ingest_bench seed --tier medium --bucket bronze --seed 42
+uv run python -m rgw_ingest_bench rtt-probe          # measured RTT to endpoint
 make netem-set DELAY=1ms && make netem-clear         # latency injection helper
 ```
 
@@ -128,10 +128,10 @@ rgw-up:      ## start Ceph RGW fixture, wait for healthy
 rgw-down:    ## docker compose --profile rgw down -v   (full reset)
 minio-up:    ## start MinIO (CI/correctness only)
 minio-down:
-seed:        ## python -m rgw_ingest_bench seed --tier $(TIER) --bucket $(BUCKET)
+seed:        ## uv run python -m rgw_ingest_bench seed --tier $(TIER) --bucket $(BUCKET)
 netem-set:   ## sudo scripts/netem.sh set $(DELAY)     (e.g. DELAY=1ms)
 netem-clear: ## sudo scripts/netem.sh clear
-test:        ## pytest with coverage flags
+test:        ## uv run pytest with coverage flags
 ```
 
 `rgw-up`/`minio-up` block until the healthcheck passes (compose
@@ -240,7 +240,7 @@ Design points:
 ### 5.2 CLI shape
 
 ```bash
-python -m rgw_ingest_bench seed --tier medium --bucket bronze --seed 42 \
+uv run python -m rgw_ingest_bench seed --tier medium --bucket bronze --seed 42 \
        [--endpoint http://localhost:8000] [--jobs 16] [--resume] [--no-verify] \
        [--manifest-out manifests/] [--json]
 ```
@@ -450,13 +450,13 @@ The unit/moto suite needs nothing but an install; the integration tests need a
 live store. From the harness root:
 
 ```bash
-pip install -e ".[dev]"              # moto, pytest-asyncio, pytest-cov, …
+uv sync --extra dev                  # moto, pytest-asyncio, pytest-cov, …
 ```
 
 **1 — Fast gate (no Docker, no store): unit + moto, with coverage:**
 
 ```bash
-pytest -m "not minio and not netem" \
+uv run pytest -m "not minio and not netem" \
        --cov=rgw_ingest_bench --cov-branch --cov-fail-under=100
 ```
 
@@ -472,14 +472,14 @@ export BENCH_S3_KIND=minio           # must match the store you started
 **3 — Run the integration tests** (`seed` correctness + the throughput check):
 
 ```bash
-pytest -m minio -v
+uv run pytest -m minio -v
 ```
 
 **4 — Just the throughput test (I1), watching the number** — `-s` un-captures
 stdout so the measured MiB/s prints:
 
 ```bash
-pytest -m minio -k throughput -s
+uv run pytest -m minio -k throughput -s
 ```
 
 The absolute floor is opt-in: set `BENCH_MIN_SEED_MIB_PER_S` to enforce it on a
@@ -487,26 +487,26 @@ store/host you trust (leave it unset ⇒ accounting-only, so CI never flakes on
 hardware variance):
 
 ```bash
-BENCH_MIN_SEED_MIB_PER_S=50 pytest -m minio -k throughput
-# Windows PowerShell:  $env:BENCH_MIN_SEED_MIB_PER_S=50; pytest -m minio -k throughput
+BENCH_MIN_SEED_MIB_PER_S=50 uv run pytest -m minio -k throughput
+# Windows PowerShell:  $env:BENCH_MIN_SEED_MIB_PER_S=50; uv run pytest -m minio -k throughput
 ```
 
 **5 — Verify seed throughput by hand (exactly what I1 automates):**
 
 ```bash
-python -m rgw_ingest_bench seed --tier small --bucket bronze --seed 42 --json
+uv run python -m rgw_ingest_bench seed --tier small --bucket bronze --seed 42 --json
 # {"files": 10000, "bytes": 1719664640, "elapsed_s": 21.3, "mib_per_s": 77.0, "files_per_s": 469.5}
 
-python -m rgw_ingest_bench seed --tier small --bucket bronze --json | jq .mib_per_s
+uv run python -m rgw_ingest_bench seed --tier small --bucket bronze --json | jq .mib_per_s
 ```
 
 **6 — (Linux, optional) verify the netem latency loop (I3):**
 
 ```bash
 make netem-set DELAY=1ms
-python -m rgw_ingest_bench rtt-probe          # median ≈ 2 ms above baseline
+uv run python -m rgw_ingest_bench rtt-probe   # median ≈ 2 ms above baseline
 make netem-clear
-BENCH_NETEM=1 pytest -m netem                 # automates the above (needs sudo tc)
+BENCH_NETEM=1 uv run pytest -m netem          # automates the above (needs sudo tc)
 ```
 
 **7 — Tear down:**

@@ -20,7 +20,7 @@ why it gets an isolated diff.
 ### 1.1 Goal
 
 ```bash
-python -m rgw_ingest_bench run --variant v1 --schema scalar --repeat 5
+uv run python -m rgw_ingest_bench run --variant v1 --schema scalar --repeat 5
 # → gate-passed rows whose counters show what s3fs ACTUALLY fetched per file
 ```
 
@@ -276,13 +276,13 @@ The unit/moto suite needs only an install; the integration tests need a live
 store. From the harness root:
 
 ```bash
-pip install -e ".[dev]"              # moto, pyarrow, pytest-cov, … (no new PR-4 deps)
+uv sync --extra dev                  # moto, pyarrow, pytest-cov, … (no new PR-4 deps)
 ```
 
 **1 — Fast gate (no Docker, no store): unit + moto, with coverage:**
 
 ```bash
-pytest -m "not minio and not netem" \
+uv run pytest -m "not minio and not netem" \
        --cov=rgw_ingest_bench --cov-branch --cov-fail-under=100
 ```
 
@@ -298,14 +298,14 @@ export BENCH_S3_KIND=minio           # must match the store you started
 **3 — Run the V1 integration tests** (throughput + H1 bytes + tap fidelity):
 
 ```bash
-pytest -m minio -v
+uv run pytest -m minio -v
 ```
 
 **4 — Just the throughput test (I1), watching the numbers** — `-s` un-captures
 stdout so the measured files/s + MiB/s print:
 
 ```bash
-pytest -m minio -k throughput -s
+uv run pytest -m minio -k throughput -s
 ```
 
 The floor is opt-in and shared with V2 (same `run` command); set it to enforce a
@@ -313,8 +313,8 @@ rate on a store/host you trust — calibrated lower for V1 than V2, since V1 mov
 whole files (leave it unset ⇒ accounting-only, so CI never flakes):
 
 ```bash
-BENCH_MIN_RUN_FILES_PER_S=50 pytest -m minio -k throughput
-# Windows PowerShell:  $env:BENCH_MIN_RUN_FILES_PER_S=50; pytest -m minio -k throughput
+BENCH_MIN_RUN_FILES_PER_S=50 uv run pytest -m minio -k throughput
+# Windows PowerShell:  $env:BENCH_MIN_RUN_FILES_PER_S=50; uv run pytest -m minio -k throughput
 ```
 
 **5 — Verify the V1-vs-V2 story by hand (what I1 + I2 automate)** — seed once,
@@ -323,9 +323,9 @@ stdout:
 
 ```bash
 make seed TIER=medium BUCKET=bronze
-python -m rgw_ingest_bench run --variant v1 --repeat 2 --tier medium --bucket bronze --json \
+uv run python -m rgw_ingest_bench run --variant v1 --repeat 2 --tier medium --bucket bronze --json \
        | jq '{bytes, mib_per_s_median, files_per_s_median}'
-python -m rgw_ingest_bench run --variant v2 --repeat 2 --tier medium --bucket bronze --json \
+uv run python -m rgw_ingest_bench run --variant v2 --repeat 2 --tier medium --bucket bronze --json \
        | jq '{bytes, mib_per_s_median, files_per_s_median}'
 # v1.bytes ≈ 17 × v2.bytes for an identical content_hash — H1, by hand (CI uses a smaller tier)
 ```
@@ -335,7 +335,7 @@ tally, independent of both client taps (§5.4):
 
 ```bash
 make rgw-stats                       # radosgw-admin bucket stats, before…
-python -m rgw_ingest_bench run --variant v1 --repeat 1 --tier medium --json
+uv run python -m rgw_ingest_bench run --variant v1 --repeat 1 --tier medium --json
 make rgw-stats                       # …and after: Δ bytes_sent ≈ v1.bytes
 ```
 

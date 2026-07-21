@@ -22,7 +22,7 @@ After this PR merges, a complete measured benchmark run works:
 
 ```bash
 make rgw-up && make seed TIER=medium
-python -m rgw_ingest_bench run --variant v2 --schema scalar --repeat 5
+uv run python -m rgw_ingest_bench run --variant v2 --schema scalar --repeat 5
 # → results/runs.jsonl rows (gate-verified) + out/v2-…parquet silver files
 ```
 
@@ -246,7 +246,7 @@ defined here, once.
 ## 7. `run` CLI command
 
 ```bash
-python -m rgw_ingest_bench run --variant v2 --schema scalar --repeat 5 \
+uv run python -m rgw_ingest_bench run --variant v2 --schema scalar --repeat 5 \
        [--warmup 1] [--tier medium] [--manifest manifests/medium-seed42.jsonl] \
        [--out-dir out/] [--results results/runs.jsonl] [--endpoint …] [--bucket …] [--json]
 ```
@@ -343,13 +343,13 @@ The unit/moto suite needs only an install; the integration tests need a live
 store with a seeded corpus. From the harness root:
 
 ```bash
-pip install -e ".[dev]"              # moto, pytest-asyncio, pyarrow, pytest-cov, …
+uv sync --extra dev                  # moto, pytest-asyncio, pyarrow, pytest-cov, …
 ```
 
 **1 — Fast gate (no Docker, no store): unit + moto, with coverage:**
 
 ```bash
-pytest -m "not minio and not netem" \
+uv run pytest -m "not minio and not netem" \
        --cov=rgw_ingest_bench --cov-branch --cov-fail-under=100
 ```
 
@@ -365,14 +365,14 @@ export BENCH_S3_KIND=minio           # must match the store you started
 **3 — Run the integration tests** (they seed their own corpus, then run V2):
 
 ```bash
-pytest -m minio -v
+uv run pytest -m minio -v
 ```
 
 **4 — Just the throughput test (I1), watching the numbers** — `-s` un-captures
 stdout so the measured files/s + MiB/s print:
 
 ```bash
-pytest -m minio -k throughput -s
+uv run pytest -m minio -k throughput -s
 ```
 
 The absolute floor is opt-in: set `BENCH_MIN_RUN_FILES_PER_S` to enforce it on a
@@ -380,8 +380,8 @@ store/host you trust (leave it unset ⇒ accounting-only, so CI never flakes on
 hardware variance):
 
 ```bash
-BENCH_MIN_RUN_FILES_PER_S=200 pytest -m minio -k throughput
-# Windows PowerShell:  $env:BENCH_MIN_RUN_FILES_PER_S=200; pytest -m minio -k throughput
+BENCH_MIN_RUN_FILES_PER_S=200 uv run pytest -m minio -k throughput
+# Windows PowerShell:  $env:BENCH_MIN_RUN_FILES_PER_S=200; uv run pytest -m minio -k throughput
 ```
 
 **5 — Verify throughput by hand (exactly what I1 automates)** — seed once, then
@@ -389,21 +389,21 @@ run V2 with `--json` and read the rate off stdout:
 
 ```bash
 make seed TIER=small BUCKET=bronze
-python -m rgw_ingest_bench run --variant v2 --schema scalar --repeat 2 \
+uv run python -m rgw_ingest_bench run --variant v2 --schema scalar --repeat 2 \
        --tier small --bucket bronze --json
 # {"variant":"v2","schema":"scalar","files":10000,"bytes":622592000,"gate_passed":true,
 #  "wall_s_median":38.1,"files_per_s_median":262.5,"mib_per_s_median":15.6,"ms_per_file_median":3.81}
 
-python -m rgw_ingest_bench run --variant v2 --repeat 2 --tier small --json | jq .files_per_s_median
+uv run python -m rgw_ingest_bench run --variant v2 --repeat 2 --tier small --json | jq .files_per_s_median
 ```
 
 **6 — (Linux, optional) verify the §7 cost model under netem (I3):**
 
 ```bash
 make netem-set DELAY=1ms
-python -m rgw_ingest_bench run --variant v2 --repeat 1 --tier small --json   # ms_per_file ≈ 6 ms (≈3 serial RTTs)
+uv run python -m rgw_ingest_bench run --variant v2 --repeat 1 --tier small --json   # ms_per_file ≈ 6 ms (≈3 serial RTTs)
 make netem-clear
-BENCH_NETEM=1 pytest -m netem                 # automates the above (needs sudo tc)
+BENCH_NETEM=1 uv run pytest -m netem          # automates the above (needs sudo tc)
 ```
 
 **7 — Tear down:**

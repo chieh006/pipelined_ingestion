@@ -23,10 +23,10 @@ harness/gate/writer (PR 3), wire tap (PR 4).
 ### 1.1 Goal
 
 ```bash
-python -m rgw_ingest_bench run --variant v3 --n-inflight 128 --queue-bound 1000 \
+uv run python -m rgw_ingest_bench run --variant v3 --n-inflight 128 --queue-bound 1000 \
        --schema scalar --repeat 5
 # → gate-passed rows; ~10k medium files in seconds at RTT≈2 ms (parent §5 model)
-python -m rgw_ingest_bench run --variant v3 --queue-bound 100 --writer-delay-ms 5
+uv run python -m rgw_ingest_bench run --variant v3 --queue-bound 100 --writer-delay-ms 5
 # → the H4 backpressure demo: flat RSS, qsize pinned at bound
 ```
 
@@ -309,13 +309,13 @@ the integration tests need a live store, and I2 additionally needs `tc`. From
 the harness root:
 
 ```bash
-pip install -e ".[dev]"              # moto[server], pytest-asyncio, pyarrow, pytest-cov, …
+uv sync --extra dev                  # moto[server], pytest-asyncio, pyarrow, pytest-cov, …
 ```
 
 **1 — Fast gate (no Docker, no store): async unit + moto-server, with coverage:**
 
 ```bash
-pytest -m "not minio and not netem" \
+uv run pytest -m "not minio and not netem" \
        --cov=rgw_ingest_bench --cov-branch --cov-fail-under=100
 ```
 
@@ -332,7 +332,7 @@ export BENCH_S3_KIND=minio           # must match the store you started
 fidelity; the netem speedup I2 is step 6):
 
 ```bash
-pytest -m minio -v
+uv run pytest -m minio -v
 ```
 
 **4 — Just the throughput test (I1), watching the numbers** — `-s` un-captures
@@ -340,7 +340,7 @@ stdout so the measured files/s + MiB/s print (`inflight_peak` lands in the
 `results/runs.jsonl` row):
 
 ```bash
-pytest -m minio -k throughput -s
+uv run pytest -m minio -k throughput -s
 ```
 
 The floor is opt-in and shared across variants (same `run` command); for V3 set
@@ -348,8 +348,8 @@ it *higher* than V2 — concurrency makes V3 the fast one (leave it unset ⇒
 accounting-only, so CI never flakes):
 
 ```bash
-BENCH_MIN_RUN_FILES_PER_S=500 pytest -m minio -k throughput
-# Windows PowerShell:  $env:BENCH_MIN_RUN_FILES_PER_S=500; pytest -m minio -k throughput
+BENCH_MIN_RUN_FILES_PER_S=500 uv run pytest -m minio -k throughput
+# Windows PowerShell:  $env:BENCH_MIN_RUN_FILES_PER_S=500; uv run pytest -m minio -k throughput
 ```
 
 **5 — Verify the V3-vs-V2 speed by hand (what I1 + I2 automate)** — seed once,
@@ -358,9 +358,9 @@ run both under netem to see the real gap, read files/s off stdout:
 ```bash
 make seed TIER=medium BUCKET=bronze
 make netem-set DELAY=1ms
-python -m rgw_ingest_bench run --variant v3 --n-inflight 64 --repeat 2 --tier medium --bucket bronze --json \
+uv run python -m rgw_ingest_bench run --variant v3 --n-inflight 64 --repeat 2 --tier medium --bucket bronze --json \
        | jq '{files_per_s_median, mib_per_s_median}'
-python -m rgw_ingest_bench run --variant v2 --repeat 2 --tier medium --bucket bronze --json \
+uv run python -m rgw_ingest_bench run --variant v2 --repeat 2 --tier medium --bucket bronze --json \
        | jq '{files_per_s_median}'
 make netem-clear
 # v3.files_per_s ≫ v2.files_per_s at RTT≈2 ms, identical content_hash — H2, by hand.
@@ -371,13 +371,13 @@ make netem-clear
 and the live store from step 2 still up:
 
 ```bash
-BENCH_NETEM=1 pytest -m netem -k speedup
+BENCH_NETEM=1 uv run pytest -m netem -k speedup
 ```
 
 **7 — See the H4 backpressure shape (I3) by hand:**
 
 ```bash
-python -m rgw_ingest_bench run --variant v3 --queue-bound 100 --writer-delay-ms 5 \
+uv run python -m rgw_ingest_bench run --variant v3 --queue-bound 100 --writer-delay-ms 5 \
        --tier small --dump-samples --json
 # then inspect the *-samples.jsonl: queue_depth pinned ≤ 100, rss_mib flat
 ```
