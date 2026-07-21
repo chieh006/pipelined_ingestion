@@ -110,7 +110,7 @@ Pure constants + tiny pure functions. **No I/O.** This module is imported by
 ```python
 HEADER_SIZE: Final[int] = 32 * 1024          # 32_768
 FOOTER_SIZE: Final[int] = 32 * 1024          # 32_768
-PATTERN_MODULUS: Final[int] = 251            # see §4.3
+PATTERN_MODULUS: Final[int] = 256            # full 8-bit pixel range 0-255; see §4.3
 ```
 
 ### 3.2 Field tables
@@ -227,32 +227,42 @@ output bytes:
 
 Same seed ⇒ byte-identical corpus + manifest. This is asserted in tests (§7).
 
-### 4.3 Pixel pattern (the off-by-one tripwire)
+### 4.3 Pixel pattern (full 8-bit values, 0–255)
 
-Purpose (parent §3.1): any range fetch that is shifted, truncated, or lands in
-the wrong section must produce bytes that *provably* aren't what was expected.
+Purpose (parent §3.1): the pixel middle is deterministic per `(file_id, offset)`
+so a corpus is byte-reproducible from a seed, and a fetched range can be checked
+against a recomputed expectation.
 
 ```python
 def expected_pixel_bytes(file_id: int, start: int, length: int) -> np.ndarray:
     """Pattern bytes for pixel-region indices [start, start+length).
 
-    byte[i] = (file_id * 31 + i) % PATTERN_MODULUS   (uint8)
+    byte[i] = (file_id * 31 + i) % 256   (uint8)
     """
 ```
 
 Design notes:
 
-- **Modulus 251 (prime), not 256.** A 256-period pattern is invisible to any
-  shift that is a multiple of 256 — and every interesting offset in this file
-  format (32 KiB header, 4 KiB blocks, s3fs block sizes) is a multiple of 256.
-  With period 251, any misalignment up to 250 bytes — and in particular all
-  power-of-two shifts — changes the bytes.
+- **Full 8-bit range, 0–255 (modulus 256).** Each pixel sample is one byte and
+  spans the complete `[0, 255]` range, emulating real 8-bit image pixel values.
+  `PATTERN_MODULUS = 256`; the `uint8` cast performs the wrap.
 - **`file_id * 31` phase term** makes the pattern file-unique, so a range read
-  from the *wrong object* also fails the check.
-- Values stay in `[0, 250]`, so `0xFF` never appears in pixels — cheap extra
-  signal when eyeballing hexdumps.
-- Implementation is vectorized: `(np.arange(start, start + length, dtype=np.int64)
-  + file_id * 31) % PATTERN_MODULUS`, cast to `uint8`. No Python-level loops.
+  from the *wrong object* still mismatches.
+- **Trade-off — accepted deliberately.** An earlier draft used a prime period
+  (251) so that *any* shift, including multiples of 256 (block/header
+  boundaries), changed the bytes and was caught by `verify_pixel_range`. Moving
+  to full-range 0–255 values means the pattern now repeats every 256 bytes, so
+  **a misread whose shift is an exact multiple of 256 is no longer detected by
+  the pixel guard** (those bytes are identical). This is an intentional choice
+  to make the synthetic data resemble real pixel values; misdirected reads are
+  still caught by the footer's `footer_magic` / `file_id_echo` tags (§3.2) and,
+  decisively, by the correctness gate (parent §7.3) that compares every
+  variant's silver output byte-for-byte. Non-256-aligned shifts and wrong-object
+  reads are still caught by `verify_pixel_range`.
+- Implementation stays vectorized and memory-lean: one 256-byte period is built
+  once and tiled to `length` (`uint8` throughout), so working memory is ≈ one
+  chunk, not an `int64` index array several times the chunk size. No
+  Python-level loops.
 
 ### 4.4 Streamed writing
 
@@ -355,13 +365,13 @@ operator runs by hand.
 | T3 | `test_spec_validation` | `FakeRawSpec` rejects `n_files=0`, negative dims, `footer_ratio=1.5`, `n_channels=0` (Pydantic `ValidationError`) |
 | T4 | `test_roundtrip_header` | generate → `parse_header` → every field equals the §4.2 formulas |
 | T5 | `test_roundtrip_footer` | footer file: `parse_footer` fields match formulas incl. array contents; footerless file: `classify_tail` says `NO_FOOTER` and trailing 32 KiB verifies as *pixels* |
-| T6 | `test_pattern_guard_detects_shift` | correct range passes `verify_pixel_range`; ranges shifted by +1, −1, +256, +4096 bytes all fail; range read with the wrong `file_id` fails |
+| T6 | `test_pattern_guard_detects_shift` (+ `_blind_to_256_multiple_shift`) | correct range passes `verify_pixel_range`; ranges shifted by a **non-multiple of 256** (+1, −1, +3, +255) fail, and a wrong-`file_id` read fails; the companion test documents the accepted limitation that a **256-aligned** shift (+256, +4096) is *not* caught (full-range 0–255 values repeat every 256 bytes, §4.3) |
 | T7 | `test_footer_magic_guard` | `parse_footer` on pixel bytes raises `IntegrityError`; short buffer raises `ValueError` |
 | T8 | `test_determinism` | two runs, same seed → byte-identical files and manifests; different seed → different footer-presence vector |
 | T9 | `test_streaming_equivalence` | chunked write (small `chunk_size`) produces bytes identical to a one-shot reference build; file size matches `expected_size` |
 | T10 | `test_footer_ratio_edges` | `footer_ratio=0.0` → no footers, `=1.0` → all footers; manifest `has_footer` matches on-disk sizes for every file |
 | T11 | `test_manifest_roundtrip` | write → `read_manifest` equality; `read_manifest_df` shape/dtypes; corrupted line → loud failure; sizes in manifest match `Path.stat()` |
-| T12 | `test_cli_generate` | CLI in `tmp_path` creates `n_files` files + manifest; exit code 0; `--json` mode (driven in-process via `cli.main([...])`) emits a valid stats object with the five keys and correct `files`/`bytes` — covers the throughput-summary branch for the 100 % gate; unknown tier / missing args → non-zero exit + usage message |
+| T12 | `test_cli_generate` | CLI in `tmp_path` creates `n_files` files + manifest; exit code 0; `--json` mode (driven in-process via `cli.main([...])`) emits a valid stats object with the six keys and correct `files`/`bytes`, plus `gib == round(bytes / 2**30, 3)` — covers the throughput-summary branch for the 100 % gate; unknown tier / missing args → non-zero exit + usage message |
 
 Coverage: 100 % line + branch on all six modules (project guideline §6);
 enforced via `--cov --cov-branch --cov-fail-under=100` in CI config (the CI
@@ -387,14 +397,16 @@ streaming.
 | # | Test | Asserts |
 |---|---|---|
 | I1 | `test_cli_roundtrip_corpus` | `generate` into `tmp_path`, then reload `manifest.jsonl` and, for **every** entry: on-disk `stat().st_size == entry.size == expected_size(...)`; `parse_header` fields equal the §4.2 formulas; `has_footer` files `parse_footer` cleanly with `file_id_echo == file_id`; a mid-pixel ranged slice passes `verify_pixel_range`. Realizes the full-corpus **correctness gate** referenced by §5/§6, exercised through the CLI. |
-| I2 | `test_cli_throughput` | run `generate --json`, parse the stats object (`files, bytes, elapsed_s, mib_per_s, files_per_s`). Assert `files == n_files` and `bytes == Σ` on-disk sizes (CLI accounting is correct); assert `mib_per_s == bytes / elapsed_s / 2**20` within 1 % (**reported throughput is accurate**, not merely present); assert `elapsed_s ≤` the test's own wall-clock around the subprocess; assert an **opt-in floor** — when `BENCH_MIN_GENERATE_MIB_PER_S` is set, the measured `mib_per_s` must clear it; unset ⇒ accounting-only, so CI never flakes on machine variance (suggested trusted-machine value ≈ 20 MiB/s) — a non-streaming / O(n²) regression trips wherever the floor is set. |
+| I2 | `test_cli_throughput` | run `generate --json`, parse the stats object (`files, bytes, gib, elapsed_s, mib_per_s, files_per_s`). Assert `files == n_files` and `bytes == Σ` on-disk sizes (CLI accounting is correct); assert `gib == round(bytes / 2**30, 3)` (the readable GiB figure mirrors the exact byte count); assert `mib_per_s == bytes / elapsed_s / 2**20` within 1 % (**reported throughput is accurate**, not merely present); assert `elapsed_s ≤` the test's own wall-clock around the subprocess; assert an **opt-in floor** — when `BENCH_MIN_GENERATE_MIB_PER_S` is set, the measured `mib_per_s` must clear it; unset ⇒ accounting-only, so CI never flakes on machine variance (suggested trusted-machine value ≈ 20 MiB/s) — a non-streaming / O(n²) regression trips wherever the floor is set. |
 | I3 | `test_cli_memory_streaming` | generate one `large`-geometry file (~32 MiB) via the CLI subprocess while sampling the child's peak RSS (`psutil`; `skipif` when unavailable); assert peak RSS stays under a small multiple of `chunk_size` and well below the file size — the executable proof of the §4.4 "never all in RAM" claim. |
 | I4 | `test_cli_determinism_e2e` | two `generate` runs, same `--seed`, different out dirs → byte-identical `manifest.jsonl` and identical per-file SHA-256 across the corpus; a third run with a different `--seed` → a differing manifest. Promotes T8's determinism claim to a through-the-CLI check. |
 
 **Throughput contract (drives the small §8 CLI addition).** So a test — or an
 operator — can *verify* throughput without scraping free text, `generate` grows
 a machine-readable summary: `--json` prints exactly one JSON object to stdout,
-`{"files", "bytes", "elapsed_s", "mib_per_s", "files_per_s"}`; without `--json`
+`{"files", "bytes", "gib", "elapsed_s", "mib_per_s", "files_per_s"}` (where
+`gib = round(bytes / 2**30, 3)` — an exact-preserving readable size beside the
+authoritative `bytes`); without `--json`
 the human summary (§8) simply gains the two rate figures. I2 parses that object.
 Its floor is opt-in and a regression tripwire, **not** a benchmark — real,
 netem-aware throughput numbers are PR 2's `metrics.py` job (non-goal here). The
@@ -443,13 +455,16 @@ BENCH_MIN_GENERATE_MIB_PER_S=50 uv run pytest -m integration -k throughput
 ```
 
 **4 — Verify throughput by hand (exactly what I2 automates)** — run the CLI with
-`--json` and read the rate straight off stdout:
+`--json` and read the rate straight off stdout. Each command clears `./corpus`
+first (`rm -rf`): `generate` overwrites the files it produces but never deletes
+others, so starting empty avoids stale `.raw` orphans if you re-run with a
+smaller file count. (`./corpus` and `*.raw` are git-ignored — safe to delete.)
 
 ```bash
-uv run python -m rgw_ingest_bench generate --tier small --out ./corpus --json
-# {"files": 10000, "bytes": 1719664640, "elapsed_s": 6.7, "mib_per_s": 244.8, "files_per_s": 1492.5}
+rm -rf ./corpus && uv run python -m rgw_ingest_bench generate --tier small --out ./corpus --json
+# {"files": 10000, "bytes": 1719664640, "gib": 1.602, "elapsed_s": 6.7, "mib_per_s": 244.8, "files_per_s": 1492.5}
 
-uv run python -m rgw_ingest_bench generate --tier small --out ./corpus --json | jq .mib_per_s
+rm -rf ./corpus && uv run python -m rgw_ingest_bench generate --tier small --out ./corpus --json | jq .mib_per_s
 ```
 
 **5 — Everything at once** (unit + integration), e.g. a pre-push check:
@@ -484,13 +499,14 @@ uv run python -m rgw_ingest_bench generate --tier small --out ./corpus --json  #
 - `argparse` subcommands; `--tier` and the explicit-spec flags are mutually
   exclusive groups. The command builds a `FakeRawSpec`, calls
   `generate_corpus`, streams the manifest to `<out>/manifest.jsonl`, and
-  prints a one-line summary — files, bytes, elapsed, **and throughput
-  (MiB/s, files/s)**, so a `generate` run doubles as a quick local throughput
-  check. `print` is acceptable here (CLI console output); progress uses
-  `logging`.
+  prints a one-line summary — files, bytes (with the GiB equivalent), elapsed,
+  **and throughput (MiB/s, files/s)**, so a `generate` run doubles as a quick
+  local throughput check. `print` is acceptable here (CLI console output);
+  progress uses `logging`.
 - `--json` emits that same summary as one JSON object on stdout
-  (`{"files", "bytes", "elapsed_s", "mib_per_s", "files_per_s"}`) and
-  suppresses the human line so stdout stays valid JSON — this is what the §7.2
+  (`{"files", "bytes", "gib", "elapsed_s", "mib_per_s", "files_per_s"}`, `gib`
+  being the exact `bytes` in gibibytes) and suppresses the human line so stdout
+  stays valid JSON — this is what the §7.2
   `test_cli_throughput` integration test parses.
 - PR 2 adds `seed` (upload) beside it; the subcommand registry is a dict so
   that addition is one entry.

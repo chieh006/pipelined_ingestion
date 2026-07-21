@@ -257,7 +257,7 @@ entry, not a new command.
 
 | # | Test | Asserts |
 |---|---|---|
-| I1 | `test_run_v1_throughput_cli` | **the CLI throughput check.** Seed a corpus, then `run --variant v1 --schema scalar --repeat 2 --json` as a subprocess; parse PR 3's summary `{files, bytes, gate_passed, wall_s_median, files_per_s_median, mib_per_s_median, …}`. Assert `gate_passed` and `files == n_files`; `files_per_s_median == files/wall_s_median` and `mib_per_s_median == bytes/wall_s_median/2**20` within 1 % (**reported throughput is accurate**); `bytes` equals the run's `bytes_fetched_audit` counter and is ≫ the ~64 KiB/file V2 would move (readahead is visible in the headline number); reuse the **opt-in** `BENCH_MIN_RUN_FILES_PER_S` floor (unset ⇒ accounting-only, so CI never flakes; the value is calibrated per variant+tier, lower for V1 since it moves whole files); finally the stdout medians reconcile with the measured rows in `results/runs.jsonl`. |
+| I1 | `test_run_v1_throughput_cli` | **the CLI throughput check.** Seed a corpus, then `run --variant v1 --schema scalar --repeat 2 --json` as a subprocess; parse PR 3's summary `{files, bytes, gib, gate_passed, wall_s_median, files_per_s_median, mib_per_s_median, …}`. Assert `gate_passed` and `files == n_files`; `files_per_s_median == files/wall_s_median` and `mib_per_s_median == bytes/wall_s_median/2**20` within 1 % (**reported throughput is accurate**); `bytes` equals the run's `bytes_fetched_audit` counter (and `gib == round(bytes/2**30, 3)`) and is ≫ the ~64 KiB/file V2 would move (readahead is visible in the headline number); reuse the **opt-in** `BENCH_MIN_RUN_FILES_PER_S` floor (unset ⇒ accounting-only, so CI never flakes; the value is calibrated per variant+tier, lower for V1 since it moves whole files); finally the stdout medians reconcile with the measured rows in `results/runs.jsonl`. |
 | I2 | `test_v1_vs_v2_bytes_and_hash_cli` | **the H1 headline, CLI-verified.** `run --variant v1` and `run --variant v2` over the same seeded bucket/schema; assert **identical `content_hash`** (the §5 cross-variant invariant — same silver from wildly different I/O) *and* that `bytes_v1 / bytes_v2` matches the §4 prediction for the seeded geometry (a bounded range, not an exact constant, so readahead variance doesn't flake) — the ~17× headline is the `medium` instantiation; CI seeds a smaller tier and asserts that tier's own ratio. The data behind PR 6's two-bar H1 figure, proven through the CLI before it is plotted. |
 | I3 | `test_run_v1_taps_fidelity_minio` | the former T11 against **real HTTP Range semantics**: cross-variant hash == V2 (T1), per-file fetch counts match the §4 regime (T2), and the two independent taps agree — `bytes_fetched_audit == bytes_fetched_wire`, `get_count == get_count_wire` (T3) — on ranges a real server answered, not moto's approximation. Tap disagreement ⇒ repetition invalid (§5.2), asserted loud. |
 
@@ -371,8 +371,8 @@ params:    s3fs_block_size, s3fs_cache_type, fetches_per_file_mean,
 ```
 
 **Throughput surfaces through PR 3's `run --json`, unchanged.** The medians
-summary (`files`, `bytes`, `mib_per_s_median`, `files_per_s_median`, …) already
-exists; for V1 its `bytes` is the `bytes_fetched_audit` total, so the readahead
+summary (`files`, `bytes`, `gib`, `mib_per_s_median`, `files_per_s_median`, …)
+already exists; for V1 its `bytes` is the `bytes_fetched_audit` total, so the readahead
 shows up directly in the `mib_per_s_median` an operator reads — no new flag, and
 the §6.2 I1 test parses the same object. The `BENCH_MIN_RUN_FILES_PER_S` floor
 (PR 1 §7.2 `BENCH_MIN_<command>_<rate>` convention) applies to `run` whatever the

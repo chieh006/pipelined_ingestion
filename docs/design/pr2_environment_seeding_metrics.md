@@ -414,7 +414,7 @@ selects the fast gate.
 | T12 | `test_fixture_files` | `docker compose config` parses both profiles (skipped if no docker CLI); images are digest-pinned (regex on the YAML); `netem.sh` passes shellcheck if available |
 | T13 | `test_cli_seed_args` | bad tier, missing endpoint, conflicting flag groups → nonzero exit + usage; `rtt-probe` command wired |
 | T14 | `test_iter_file_chunks_equivalence` | PR 1 refactor guard: chunks concatenated == `generate_file` output byte-for-byte (complements PR 1 T9) |
-| T15 | `test_seed_json_summary` | `seed --json` (driven in-process via `cli.main([...])` against moto) prints one stats object `{files, bytes, elapsed_s, mib_per_s, files_per_s}`; `files == n_files`, `bytes == Σ` manifest sizes, rates self-consistent (`mib_per_s == bytes/elapsed_s/2**20`, `files_per_s == files/elapsed_s`) — covers the throughput-summary branch for the coverage gate; the figures equal the `results/seed.jsonl` `RunResult` row |
+| T15 | `test_seed_json_summary` | `seed --json` (driven in-process via `cli.main([...])` against moto) prints one stats object `{files, bytes, gib, elapsed_s, mib_per_s, files_per_s}`; `files == n_files`, `bytes == Σ` manifest sizes, `gib == round(bytes/2**30, 3)`, rates self-consistent (`mib_per_s == bytes/elapsed_s/2**20`, `files_per_s == files/elapsed_s`) — covers the throughput-summary branch for the coverage gate; the figures equal the `results/seed.jsonl` `RunResult` row |
 
 ### 8.2 Integration tests (live object store)
 
@@ -428,14 +428,15 @@ and skipped locally by default (parent §12's "MinIO/moto integration marks").
 
 | # | Test | Asserts |
 |---|---|---|
-| I1 | `test_seed_throughput_cli` | **the CLI throughput check.** `seed --tier small --json` into the live bucket as a subprocess; parse the stats object `{files, bytes, elapsed_s, mib_per_s, files_per_s}`. Assert `files == n_files` and `bytes == Σ` on-store `LIST` sizes (upload accounting is correct); `mib_per_s == bytes/elapsed_s/2**20` within 1 % (**reported throughput is accurate**, not merely present); `elapsed_s ≤` the test's own wall-clock; an **opt-in floor** — when `BENCH_MIN_SEED_MIB_PER_S` is set, the measured `mib_per_s` must clear it; unset ⇒ accounting-only, so CI never flakes on hardware (suggested trusted-loopback value ≈ 5 MiB/s) — a serialized-upload / non-streaming regression trips wherever the floor is set; finally the stdout figures equal the `results/seed.jsonl` `RunResult` row (`wall_s`, `files_per_s`, byte counters) — CLI, sink, and store all agree. |
+| I1 | `test_seed_throughput_cli` | **the CLI throughput check.** `seed --tier small --json` into the live bucket as a subprocess; parse the stats object `{files, bytes, gib, elapsed_s, mib_per_s, files_per_s}`. Assert `files == n_files` and `bytes == Σ` on-store `LIST` sizes (upload accounting is correct); `gib == round(bytes/2**30, 3)`; `mib_per_s == bytes/elapsed_s/2**20` within 1 % (**reported throughput is accurate**, not merely present); `elapsed_s ≤` the test's own wall-clock; an **opt-in floor** — when `BENCH_MIN_SEED_MIB_PER_S` is set, the measured `mib_per_s` must clear it; unset ⇒ accounting-only, so CI never flakes on hardware (suggested trusted-loopback value ≈ 5 MiB/s) — a serialized-upload / non-streaming regression trips wherever the floor is set; finally the stdout figures equal the `results/seed.jsonl` `RunResult` row (`wall_s`, `files_per_s`, byte counters) — CLI, sink, and store all agree. |
 | I2 | `test_seed_correctness_minio` | the T9–T11 duplication against **real multipart**: object count/sizes/manifest + `RunResult` row (T9); truncate one object → verify exits nonzero naming the key (T10); interrupt-then-`--resume` uploads only the missing keys, and `--jobs 1` vs `--jobs 8` stay byte-identical (T11). Keeps moto honest about the multipart semantics RGW/MinIO actually enforce. |
 | I3 | `test_rtt_probe_netem` | the §6 latency loop end-to-end through the CLI: with `scripts/netem.sh set <d>` applied, `rtt-probe` reads median ≈ `2·d` + baseline; after `clear`, back to baseline. Marked `@pytest.mark.netem` and **skipped unless** `BENCH_NETEM=1` and the process can `sudo tc` (root + Linux) — otherwise it stays the §9 manual acceptance step. |
 
 **Throughput contract (mirrors PR 1's `generate --json`).** So a test — or an
 operator — can *verify* seed throughput without scraping log lines, `seed` grows
 the same machine-readable summary: `--json` prints exactly one JSON object to
-stdout, `{"files", "bytes", "elapsed_s", "mib_per_s", "files_per_s"}`, and
+stdout, `{"files", "bytes", "gib", "elapsed_s", "mib_per_s", "files_per_s"}`
+(`gib` = the exact `bytes` in gibibytes, `round(bytes/2**30, 3)`), and
 suppresses the human summary so stdout stays valid JSON. These are the same
 numbers `seed` already records in the `results/seed.jsonl` `RunResult` row
 (§7.2); I1 parses the object and cross-checks it against that row. The floor is
@@ -495,7 +496,7 @@ BENCH_MIN_SEED_MIB_PER_S=50 uv run pytest -m minio -k throughput
 
 ```bash
 uv run python -m rgw_ingest_bench seed --tier small --bucket bronze --seed 42 --json
-# {"files": 10000, "bytes": 1719664640, "elapsed_s": 21.3, "mib_per_s": 77.0, "files_per_s": 469.5}
+# {"files": 10000, "bytes": 1719664640, "gib": 1.602, "elapsed_s": 21.3, "mib_per_s": 77.0, "files_per_s": 469.5}
 
 uv run python -m rgw_ingest_bench seed --tier small --bucket bronze --json | jq .mib_per_s
 ```

@@ -306,7 +306,7 @@ not netem"` is the fast gate.
 | T9 | `test_harness_lifecycle` | registry lookup; fresh Metrics per rep (no leakage); only step 3 timed (probe/gate excluded — asserted via injected slow gate); dummy test-only variant plugs into the registry, proving the PR 4/5 extension seam |
 | T10 | `test_run_cli` | warmup rows flagged; `--repeat 3` → 3 measured rows; unknown variant / missing manifest / bad schema → nonzero exit + usage; output filenames unique across reps |
 | T11 | `test_runresult_backcompat` | PR 2 `seed.jsonl` rows (no gate/output_path) still parse under the extended model |
-| T12 | `test_run_json_summary` | `run --variant v2 --json` (driven in-process via `cli.main([...])` against moto) prints one summary object `{variant, schema, files, bytes, gate_passed, wall_s_median, files_per_s_median, mib_per_s_median, ms_per_file_median, run_ids}`; `files == n_files`, `gate_passed` true, rates self-consistent (`files_per_s == files/wall_s`, `mib_per_s == bytes/wall_s/2**20`) — covers the throughput-summary branch for the coverage gate; the figures reconcile with the `results/runs.jsonl` rows |
+| T12 | `test_run_json_summary` | `run --variant v2 --json` (driven in-process via `cli.main([...])` against moto) prints one summary object `{variant, schema, files, bytes, gib, gate_passed, wall_s_median, files_per_s_median, mib_per_s_median, ms_per_file_median, run_ids}` (`gib = round(bytes/2**30, 3)`); `files == n_files`, `gate_passed` true, rates self-consistent (`files_per_s == files/wall_s`, `mib_per_s == bytes/wall_s/2**20`) — covers the throughput-summary branch for the coverage gate; the figures reconcile with the `results/runs.jsonl` rows |
 
 ### 8.2 Integration tests (live object store)
 
@@ -321,7 +321,7 @@ numbers via `make rgw-up`), pointed at it with the `BENCH_S3_*` env. Marked
 
 | # | Test | Asserts |
 |---|---|---|
-| I1 | `test_run_v2_throughput_cli` | **the CLI throughput check.** Seed a `small`-ish corpus into the live bucket, then `run --variant v2 --schema scalar --repeat 2 --json` as a subprocess; parse the summary `{files, bytes, gate_passed, wall_s_median, files_per_s_median, mib_per_s_median, ms_per_file_median, …}`. Assert `gate_passed` is true and `files == n_files`; `bytes ≈ 32768·(n + n_footer)` (the ~64 KiB/file V2 cost model, §4); `files_per_s_median == files/wall_s_median` and `mib_per_s_median == bytes/wall_s_median/2**20` within 1 % (**reported throughput is accurate**, not merely present); an **opt-in floor** — when `BENCH_MIN_RUN_FILES_PER_S` is set, the measured `files_per_s_median` must clear it; unset ⇒ accounting-only, so CI never flakes on hardware (suggested trusted-loopback value ≈ 20 files/s) — a serialized-stall or accidental full-GET regression trips wherever the floor is set; finally the stdout medians reconcile with the measured (non-warmup) rows in `results/runs.jsonl` — CLI, sink, and store all agree. |
+| I1 | `test_run_v2_throughput_cli` | **the CLI throughput check.** Seed a `small`-ish corpus into the live bucket, then `run --variant v2 --schema scalar --repeat 2 --json` as a subprocess; parse the summary `{files, bytes, gib, gate_passed, wall_s_median, files_per_s_median, mib_per_s_median, ms_per_file_median, …}`. Assert `gate_passed` is true and `files == n_files`; `bytes ≈ 32768·(n + n_footer)` (the ~64 KiB/file V2 cost model, §4); `files_per_s_median == files/wall_s_median` and `mib_per_s_median == bytes/wall_s_median/2**20` within 1 % (**reported throughput is accurate**, not merely present); an **opt-in floor** — when `BENCH_MIN_RUN_FILES_PER_S` is set, the measured `files_per_s_median` must clear it; unset ⇒ accounting-only, so CI never flakes on hardware (suggested trusted-loopback value ≈ 20 files/s) — a serialized-stall or accidental full-GET regression trips wherever the floor is set; finally the stdout medians reconcile with the measured (non-warmup) rows in `results/runs.jsonl` — CLI, sink, and store all agree. |
 | I2 | `test_run_v2_fidelity_minio` | the former T12: `run --variant v2` against real MinIO range semantics — gate passes, parquet row count == n_files, per-file counters exact (`head == n`, `get == n + n_footer`, `bytes == 32768·(n + n_footer)`), content hash stable across two runs. Catches HEAD/range behavior moto does not model (§10 Q1). |
 | I3 | `test_run_v2_latency_band_netem` | mechanizes the §7 cost-model sanity check: with `scripts/netem.sh set <d>` applied, a short `run` reports `ms_per_file_median ≈ 3·(2·d)` + baseline (V2's three serial RTTs) — the "wildly different ⇒ harness broken" guard, automated. Marked `@pytest.mark.netem`, **skipped unless** `BENCH_NETEM=1` and the process can `sudo tc` (root + Linux); otherwise it stays the §9 manual step. |
 
@@ -391,7 +391,7 @@ run V2 with `--json` and read the rate off stdout:
 make seed TIER=small BUCKET=bronze
 uv run python -m rgw_ingest_bench run --variant v2 --schema scalar --repeat 2 \
        --tier small --bucket bronze --json
-# {"variant":"v2","schema":"scalar","files":10000,"bytes":622592000,"gate_passed":true,
+# {"variant":"v2","schema":"scalar","files":10000,"bytes":622592000,"gib":0.580,"gate_passed":true,
 #  "wall_s_median":38.1,"files_per_s_median":262.5,"mib_per_s_median":15.6,"ms_per_file_median":3.81}
 
 uv run python -m rgw_ingest_bench run --variant v2 --repeat 2 --tier small --json | jq .files_per_s_median

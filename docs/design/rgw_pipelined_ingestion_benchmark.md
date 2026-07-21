@@ -88,9 +88,16 @@ verification**:
   `img_width:int32@0`, `img_height:int32@4`, `file_id:int32@20`,
   `pixel_size_x:float32@48`, `scan_dir:int32@92`, `channel_mask:int32@17720`.
   `file_id` encodes the corpus index so every variant's parse can be asserted.
-- **Pixels (`W·H·C` bytes):** a deterministic repeating pattern derived from
-  `file_id` (not random, not zeros) — lets integrity checks detect off-by-one
-  range math (e.g., a "footer" fetch that actually returned pixel bytes).
+- **Pixels (`W·H·C` bytes):** a deterministic pattern `byte[i] = (file_id·31 + i)
+  mod 256` (not random, not zeros), so each 1-byte sample spans the full 8-bit
+  range 0–255, emulating real image pixel values. It lets integrity checks
+  detect most off-by-one range math (e.g., a "footer" fetch that actually
+  returned pixel bytes). **Limitation:** because the pattern repeats every 256
+  bytes, a misread shifted by an *exact multiple of 256* is not detectable from
+  the pixel bytes alone; that class of error is instead caught by the footer's
+  `footer_magic` / `file_id_echo` tags and, authoritatively, by the §7.3
+  correctness gate. (An earlier design used a prime period of 251 to catch even
+  256-aligned shifts, traded away here for full-range pixel values.)
 - **Footer (32 KiB, present with probability `footer_ratio`, default 0.9):**
   a few scalars + two `float32[4070]` arrays (`local_offset_x/y`), mirroring the
   production footer's dominant payload.
@@ -255,7 +262,9 @@ throughput curve. Knob B caps completed rows buffered in RAM
 3. Parse header (`np.frombuffer` at fixed offsets).
 4. Footer-presence check: `size − 32768 − W·H·C == 32768` → trailing bytes are the
    footer; `== 0` → they are pixels, discard; anything else → integrity error.
-5. Cross-check the pixel-pattern guard bytes (corpus is self-describing, §3.1).
+5. Cross-check the pixel-pattern guard bytes (corpus is self-describing, §3.1) —
+   best-effort: catches non-256-aligned shifts and wrong-object reads; footer
+   tags and the §7.3 gate are the authoritative integrity checks.
 6. `await queue.put(row)` ← the backpressure point.
 
 **Retries:** ≤3 attempts on 5xx/timeout, exponential backoff + jitter. A file that

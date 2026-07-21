@@ -64,7 +64,7 @@ Consumed **unchanged**:
 
 | Interface | From | Used for |
 |---|---|---|
-| `parse_header`, `parse_footer`, `classify_tail`, `verify_pixel_range`, `expected_pixel_bytes` | PR 1 | same parsing, now under concurrency; the §6.3 step-5 guard check finally uses `verify_pixel_range` in production code |
+| `parse_header`, `parse_footer`, `classify_tail`, `verify_pixel_range`, `expected_pixel_bytes` | PR 1 | same parsing, now under concurrency; the §6.3 step-5 guard check finally uses `verify_pixel_range` in production code (best-effort since PR 1 §4.3 — blind to 256-aligned shifts; footer tags + the gate are authoritative) |
 | `CounterSet` (lock-guarded — designed in PR 2 §7.1 *for this PR's* `to_thread` offload), `LatencyRecorder`, `PeriodicSampler`, `EventLoopLagProbe` | PR 2 | queue-depth/RSS/lag sampling slots exist; V3 plugs probes in, zero sampler changes |
 | `VariantHarness` lifecycle, registry, dead-letter-invalidates-run rule | PR 3 | the rule was implemented harness-side in PR 3 precisely so V3 inherits it |
 | `gate.verify_output` canonical sort | PR 3 | V3 is the first variant with nondeterministic row order — PR 3's T5 ("row order alone must NOT fail") was written for this moment |
@@ -150,7 +150,14 @@ Notes:
 - **The guard check (step 4, NO_FOOTER arm)** is the §6.3 step-5 pixel-pattern
   cross-check: a range-math bug (off-by-one start, wrong key) produces bytes
   that fail `verify_pixel_range` or `footer_magic` — caught per-file, routed
-  to dead-letter, never silently wrong silver.
+  to dead-letter, never silently wrong silver. **Caveat (PR 1 §4.3):** pixels
+  now use full 0–255 values (period 256), so `verify_pixel_range` no longer
+  catches a shift that is an *exact multiple of 256*. It still catches
+  non-256-aligned shifts and wrong-object reads; footer files remain fully
+  guarded by `footer_magic` / `file_id_echo`; and the authoritative net is the
+  correctness gate (PR 3 §5), which compares every variant's silver output
+  byte-for-byte regardless. For NO_FOOTER files the tail is discarded anyway, so
+  a missed 256-aligned tail misread cannot corrupt silver output.
 - **Retries**: each *file* (not each GET) wrapped by the async retry helper —
   ≤3 attempts, exponential backoff + jitter on 5xx/timeout. Exhausted →
   `DeadLetterRecord(key, error, attempts, ts)` appended to
@@ -262,7 +269,7 @@ the fast gate is `-m "not minio and not netem"`.
 | T4 | `test_sentinel_shutdown` | exactly one sentinel; final partial row group written; parquet valid & row-complete after close; a pre-close read attempt fails (invalid-until-close, parent §6.3) |
 | T5 | `test_dead_letter` | one key persistently 500s: run completes, n−1 rows written, dead-letter JSONL has the key + attempts=3, `files_failed=1`, harness marks run invalid, exit ≠ 0 (PR 3 rule firing) |
 | T6 | `test_retry_transient` | key fails twice then succeeds → row present, no dead-letter, retry counter == 2, backoff delays observed (fake clock) |
-| T7 | `test_guard_paths` | monkeypatched fetch returning shifted tail → `verify_pixel_range`/`footer_magic` failure → dead-letter (not crash, not wrong silver); truncated-size manifest entry → CORRUPT → dead-letter |
+| T7 | `test_guard_paths` | monkeypatched fetch returning a **non-256-aligned** shifted tail → `verify_pixel_range` failure → dead-letter; footer bytes with a bad sentinel → `footer_magic` failure → dead-letter (not crash, not wrong silver); truncated-size manifest entry → CORRUPT → dead-letter. (A 256-aligned tail shift is intentionally *not* guard-detectable per PR 1 §4.3; it cannot corrupt silver because NO_FOOTER tails are discarded, and the gate is the byte-for-byte backstop.) |
 | T8 | `test_failure_propagation` | writer raising mid-run → TaskGroup cancels fetchers, no hang, error surfaces, partial output not gate-passed; fetcher cancelled while blocked on full queue → unblocks cleanly |
 | T9 | `test_parallel_header_footer` | tap timestamps: for each file the two GETs overlap in time (moto-server latency shim) — the §2 parallelism actually happens |
 | T10 | `test_pool_fix` | live client config shows `max_pool_connections == n_inflight + 8`; simulated cap (pool forced to 10, N=64) → `inflight_peak ≤ 10` detected → run invalid with the §6.5 error |
@@ -287,7 +294,7 @@ entry plus knob flags, not a new command.
 
 | # | Test | Asserts |
 |---|---|---|
-| I1 | `test_run_v3_throughput_cli` | **the CLI throughput check.** Seed a corpus, then `run --variant v3 --n-inflight 32 --schema scalar --repeat 2 --json` as a subprocess; parse PR 3's summary `{files, bytes, gate_passed, wall_s_median, files_per_s_median, mib_per_s_median, …}`. Assert `gate_passed` and `files == n_files`; `files_per_s_median == files/wall_s_median` and `mib_per_s_median == bytes/wall_s_median/2**20` within 1 % (**reported throughput is accurate**); `bytes ≈ 65 536·n` (V3 is ranged like V2, not V1's whole-file readahead); the matching `results/runs.jsonl` row has `params.inflight_peak > 1` (concurrency actually happened on a real socket — the §6 proof); reuse the **opt-in** `BENCH_MIN_RUN_FILES_PER_S` floor (unset ⇒ accounting-only, so CI never flakes; set *higher* than V2, since V3 is the fast one); the stdout medians reconcile with those rows. |
+| I1 | `test_run_v3_throughput_cli` | **the CLI throughput check.** Seed a corpus, then `run --variant v3 --n-inflight 32 --schema scalar --repeat 2 --json` as a subprocess; parse PR 3's summary `{files, bytes, gib, gate_passed, wall_s_median, files_per_s_median, mib_per_s_median, …}`. Assert `gate_passed` and `files == n_files`; `files_per_s_median == files/wall_s_median` and `mib_per_s_median == bytes/wall_s_median/2**20` within 1 % (**reported throughput is accurate**); `bytes ≈ 65 536·n` (V3 is ranged like V2, not V1's whole-file readahead); the matching `results/runs.jsonl` row has `params.inflight_peak > 1` (concurrency actually happened on a real socket — the §6 proof); reuse the **opt-in** `BENCH_MIN_RUN_FILES_PER_S` floor (unset ⇒ accounting-only, so CI never flakes; set *higher* than V2, since V3 is the fast one); the stdout medians reconcile with those rows. |
 | I2 | `test_v3_vs_v2_speedup_netem` | **the H2/H3 headline, CLI-verified.** Under `scripts/netem.sh set <d>` (so there is latency to hide), `run --variant v3 --n-inflight 64` and `run --variant v2` over the same seeded bucket; assert **identical `content_hash`** (V3 == V2 == V1 silver) *and* `files_per_s_median(v3) ≥ 3× files_per_s_median(v2)` — the concurrency speedup, asserted as a conservative multiple so it can't flake but a collapsed pipeline trips. Marked `@pytest.mark.netem`, **skipped unless** `BENCH_NETEM=1` and the process can `sudo tc` (root + Linux); on loopback (RTT≈0) the speedup legitimately vanishes (§6 loop-bound regime), which is *why* it is netem-gated, not run bare. |
 | I3 | `test_v3_backpressure_cli` | **H4 via the CLI.** `run --variant v3 --queue-bound 100 --writer-delay-ms 5 --dump-samples --json` on a few hundred files; from the dumped sampler JSONL assert `queue_depth ≤ queue_bound` at every sample and `rss_mib` flat (no growth ∝ files) — bounded memory under a deliberately throttled writer, read straight from a real run. The §1.1 backpressure demo, mechanized. |
 | I4 | `test_v3_fidelity_minio` | the former T16 against **real HTTP under concurrency**: cross-variant hash == V1/V2 (T1); manifest-mode counters `head_count == 0`, `get_count == 2n`, `bytes == 65 536·n` (T2); backpressure holds (T3) — on genuinely concurrent ranged GETs a real server answered, not moto's approximation. Also confirms the §6.5 pool sizing on a live client (`max_pool == n_inflight + 8`). |
