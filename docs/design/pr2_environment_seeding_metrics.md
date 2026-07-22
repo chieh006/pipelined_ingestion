@@ -39,6 +39,12 @@ Deliverables:
    and periodic samplers that every variant (PR 3+) will populate.
 6. **`config.py`** — `S3Config` (endpoint/credentials/bucket), Pydantic,
    env-driven.
+7. **Version bump** — `src/rgw_ingest_bench/__init__.py` `__version__`
+   **`0.1.0 → 0.2.0`** (MINOR: new `config.py` + `metrics.py`, `seed` /
+   `rtt-probe` commands; behaviour-preserving refactors to `fakeraw.py` /
+   `cli.py`, §2). This is the only file to touch: PR 1 wired `pyproject.toml`
+   to hatch `dynamic = ["version"]`, so `__init__.py` is the single source of
+   truth (root CLAUDE.md §7).
 
 ### 1.2 Non-goals (deferred)
 
@@ -64,7 +70,10 @@ PR 2 **consumes** these PR 1 interfaces unchanged:
 | footer-presence vector — pure function of `(seed, n_files, footer_ratio)` (PR 1 §4.2) | upfront manifest computation; upload-order independence |
 | CLI subcommand registry dict (PR 1 §8) | `seed` and `rtt-probe` are two new entries |
 
-PR 2 makes **one additive change** to PR 1 code, and nothing else:
+PR 2 makes **two small, behaviour-preserving changes** to PR 1 code, and
+nothing else — `generate`'s bytes, manifest, and CLI surface all stay unchanged:
+
+**1. Streaming hook for `seed`:**
 
 > **`fakeraw.iter_file_chunks(spec, file_id, has_footer, *, chunk_size) ->
 > Iterator[bytes]`** — extracted from the body of `generate_file`, which
@@ -73,6 +82,15 @@ PR 2 makes **one additive change** to PR 1 code, and nothing else:
 > passing untouched). This gives `seed` a way to stream a file's bytes
 > straight into an S3 multipart upload without staging the corpus on local
 > disk — `medium` is ~10.6 GiB and the WSL2 box shouldn't need that free.
+
+**2. Shared CLI flags lifted into an `argparse` parent parser** (`cli.py`, §5.2):
+
+> PR 1 defines the tier / explicit-spec flags inline on the `generate`
+> subparser; `seed` needs the same group, so those definitions move **once**
+> into a common parent parser that both subcommands inherit — no duplicated
+> flag definitions. A pure refactor: `generate`'s flags, mutually-exclusive
+> groups, and `--json` output stay byte-for-byte identical; only the
+> definition *site* moves.
 
 Determinism carries over intact: because every byte is a pure function of
 `(seed, file_id)` and footer presence is one upfront vector draw, **parallel
@@ -231,8 +249,9 @@ Design points:
   decision to store relative POSIX paths is what makes local paths and S3
   keys the same string.
 - Progress: `logging.info` every 1 000 files with running MiB/s; final
-  one-line summary via `print` — files, bytes, elapsed, **and throughput
-  (MiB/s, files/s)** — so a `seed` run doubles as a quick throughput check
+  one-line summary via `print` — files, bytes (with the GiB equivalent),
+  elapsed, **and throughput (MiB/s, files/s)** — so a `seed` run doubles as a
+  quick throughput check
   (CLI console output, allowed). `--json` (§5.2) emits those same figures as
   one machine-readable object on stdout for scripting and the §8.2 throughput
   integration test.
@@ -247,8 +266,10 @@ uv run python -m rgw_ingest_bench seed --tier medium --bucket bronze --seed 42 \
 
 Tier/explicit-spec flag groups are shared with `generate` via a common
 `argparse` parent parser (defined once in `cli.py` — no duplicated flag
-definitions). `seed` registers in the PR 1 subcommand dict; `generate` is
-untouched.
+definitions; this is §2's behaviour-preserving change (2), which lifts PR 1's
+inline `generate` flags into that parent parser). `seed` registers in the PR 1
+subcommand dict; `generate`'s flags and `--json` output are unchanged — only
+the definition site moves.
 
 ---
 

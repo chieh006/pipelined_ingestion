@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rgw-ingest-bench"
-version = "0.1.0"
+dynamic = ["version"]
 description = "RGW pipelined-ingestion benchmark harness — synthetic corpus foundation (PR 1)."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -23,6 +23,11 @@ dev = [
 
 [project.scripts]
 rgw-ingest-bench = "rgw_ingest_bench.cli:main"
+
+# Single source of truth for the version: read from the package __init__.
+# Never write the version anywhere but src/rgw_ingest_bench/__init__.py.
+[tool.hatch.version]
+path = "src/rgw_ingest_bench/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rgw_ingest_bench"]
