@@ -70,8 +70,8 @@ def test_determinism_same_seed(tiny_spec: FakeRawSpec, tmp_path) -> None:
 def test_determinism_different_seed(tiny_spec: FakeRawSpec, tmp_path) -> None:
     """T8 (unhappy): a different seed changes the footer-presence vector."""
     other = tiny_spec.model_copy(update={"seed": 123})
-    flags_a = fakeraw._footer_flags(tiny_spec)
-    flags_b = fakeraw._footer_flags(other)
+    flags_a = fakeraw.footer_flags(tiny_spec)
+    flags_b = fakeraw.footer_flags(other)
     assert not np.array_equal(flags_a, flags_b)
 
     dir_a = tmp_path / "a"

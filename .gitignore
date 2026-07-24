@@ -16,3 +16,8 @@ htmlcov/
 corpus/
 *.raw
 
+# Personal ML-infra career-prep docs (not part of this project)
+docs/gap_project_plan.md
+docs/ml_infra_role_ranking.md
+docs/ml_infra_role_targets.md
+

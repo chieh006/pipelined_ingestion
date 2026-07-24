@@ -1,0 +1,64 @@
+# Object-store fixtures for the benchmark harness. Two mutually-exclusive
+# profiles, so a bare `up` starts nothing:
+#
+#   docker compose --profile rgw   up -d --wait   # Ceph RGW  (primary fixture)
+#   docker compose --profile minio up -d --wait   # MinIO     (CI / correctness)
+#   docker compose --profile rgw   down -v         # full, disposable reset
+#
+# Images are pinned by digest, never floating tags (parent §14a: disposability +
+# exact pinning is why the container fixture beat microceph).
+#
+# NOTE: both images are pinned to REAL digests, verified on a Docker host —
+# `docker compose config` parses, each image ships the healthcheck's curl, and
+# the live-store suite (`pytest -m minio`) is green against MinIO *and* RGW.
+# The RGW demo runs a single-node cluster; its HEALTH_WARN (1 OSD < pool size 2)
+# is expected and harmless for the fixture.
+services:
+  rgw: # Ceph RGW demo container — the primary, headline fixture.
+    image: quay.io/ceph/demo@sha256:522483cf07cfce6386b8e18a3edfa88a1b32c688dee231d0a6962b1513557723
+    profiles: ["rgw"]
+    # Static IP so MON_IP / CEPH_PUBLIC_NETWORK are deterministic — the demo
+    # entrypoint requires CEPH_PUBLIC_NETWORK (auto-detect alone is rejected).
+    networks:
+      cephnet:
+        ipv4_address: 10.99.0.10
+    environment:
+      MON_IP: "10.99.0.10"
+      CEPH_PUBLIC_NETWORK: "10.99.0.0/24"
+      CEPH_DEMO_UID: demo
+      # Test-only constants, never real secrets.
+      CEPH_DEMO_ACCESS_KEY: bench
+      CEPH_DEMO_SECRET_KEY: bench-secret
+      RGW_NAME: localhost
+      # 1 GiB OSD memory target — parent §11, within the 7 GiB WSL2 cap.
+      # (Informational: the demo entrypoint may not apply it; set via `ceph
+      # config` if OSD RSS matters on a constrained box.)
+      OSD_MEMORY_TARGET: "1073741824"
+    ports:
+      - "8000:8080" # RGW (beast) listens on 8080 inside the container, not 80.
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080"]
+      interval: 5s
+      retries: 60
+
+  minio: # MinIO — CI / correctness fallback only, never headline numbers.
+    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    profiles: ["minio"]
+    command: server /data
+    environment:
+      # Test-only constants, never real secrets.
+      MINIO_ROOT_USER: bench
+      MINIO_ROOT_PASSWORD: bench-secret
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      retries: 30
+
+# Dedicated subnet for the RGW fixture so its MON_IP is fixed and known.
+networks:
+  cephnet:
+    ipam:
+      config:
+        - subnet: 10.99.0.0/24

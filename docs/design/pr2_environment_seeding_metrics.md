@@ -70,7 +70,7 @@ PR 2 **consumes** these PR 1 interfaces unchanged:
 | footer-presence vector — pure function of `(seed, n_files, footer_ratio)` (PR 1 §4.2) | upfront manifest computation; upload-order independence |
 | CLI subcommand registry dict (PR 1 §8) | `seed` and `rtt-probe` are two new entries |
 
-PR 2 makes **two small, behaviour-preserving changes** to PR 1 code, and
+PR 2 makes **three small, behaviour-preserving changes** to PR 1 code, and
 nothing else — `generate`'s bytes, manifest, and CLI surface all stay unchanged:
 
 **1. Streaming hook for `seed`:**
@@ -91,6 +91,15 @@ nothing else — `generate`'s bytes, manifest, and CLI surface all stay unchange
 > flag definitions. A pure refactor: `generate`'s flags, mutually-exclusive
 > groups, and `--json` output stay byte-for-byte identical; only the
 > definition *site* moves.
+
+**3. Footer-vector helper promoted from private to public** (`fakeraw.py`):
+
+> `_footer_flags` becomes public `footer_flags(spec)` — the pure
+> `(seed, n_files, footer_ratio)` draw the table above lists as a consumed
+> interface. `seed`'s upfront manifest (§5.1) recomputes footer presence from
+> it, so a corpus and its uploaded copy carry identical footers with no
+> duplicated draw logic. Rename only: `generate_corpus`'s single caller is
+> updated and its behaviour is unchanged.
 
 Determinism carries over intact: because every byte is a pure function of
 `(seed, file_id)` and footer presence is one upfront vector draw, **parallel

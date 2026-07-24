@@ -174,6 +174,48 @@ def _build_footer(file_id: int) -> bytes:
     return _pack_section(FOOTER_FIELDS, values, FOOTER_SIZE)
 
 
+def iter_file_chunks(
+    spec: FakeRawSpec,
+    file_id: int,
+    has_footer: bool,
+    *,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> Iterator[bytes]:
+    """Yield one file's bytes in order: header, pixel slabs, optional footer.
+
+    This is the streaming core shared by local writes (:func:`generate_file`)
+    and the PR 2 ``seed`` command, which pipes the chunks straight into an S3
+    multipart upload without staging the file on disk. Peak working memory is
+    roughly one ``chunk_size`` slab regardless of file size.
+
+    Parameters
+    ----------
+    spec : FakeRawSpec
+        Corpus spec supplying geometry.
+    file_id : int
+        Logical file identifier.
+    has_footer : bool
+        Whether to append a footer.
+    chunk_size : int, optional
+        Pixel slab size in bytes. Defaults to 4 MiB.
+
+    Yields
+    ------
+    bytes
+        The next slab of file content: the header, then pixel slabs, then the
+        footer when ``has_footer``.
+    """
+    yield _build_header(spec, file_id)
+    total_pixels = pixel_bytes(spec.img_width, spec.img_height, spec.n_channels)
+    written = 0
+    while written < total_pixels:
+        slab = min(chunk_size, total_pixels - written)
+        yield expected_pixel_bytes(file_id, written, slab).tobytes()
+        written += slab
+    if has_footer:
+        yield _build_footer(file_id)
+
+
 def generate_file(
     spec: FakeRawSpec,
     file_id: int,
@@ -184,9 +226,9 @@ def generate_file(
 ) -> ManifestEntry:
     """Write one synthetic ``.raw`` file and return its manifest entry.
 
-    The header is built in one 32 KiB buffer, the pixel middle is written in
-    ``chunk_size`` slabs, and the footer (if present) is appended — so peak
-    memory is roughly one chunk regardless of file size.
+    A thin wrapper over :func:`iter_file_chunks`: it opens ``out_path`` and
+    writes each yielded slab, so peak memory is roughly one chunk regardless of
+    file size.
 
     Parameters
     ----------
@@ -206,16 +248,9 @@ def generate_file(
     ManifestEntry
         Entry describing the written file.
     """
-    total_pixels = pixel_bytes(spec.img_width, spec.img_height, spec.n_channels)
     with out_path.open("wb") as handle:
-        handle.write(_build_header(spec, file_id))
-        written = 0
-        while written < total_pixels:
-            slab = min(chunk_size, total_pixels - written)
-            handle.write(expected_pixel_bytes(file_id, written, slab).tobytes())
-            written += slab
-        if has_footer:
-            handle.write(_build_footer(file_id))
+        for chunk in iter_file_chunks(spec, file_id, has_footer, chunk_size=chunk_size):
+            handle.write(chunk)
     return ManifestEntry(
         path=Path(out_path.name).as_posix(),
         size=out_path.stat().st_size,
@@ -224,8 +259,25 @@ def generate_file(
     )
 
 
-def _footer_flags(spec: FakeRawSpec) -> np.ndarray:
-    """Draw the per-file footer-presence vector in one vectorized call."""
+def footer_flags(spec: FakeRawSpec) -> np.ndarray:
+    """Draw the per-file footer-presence vector in one vectorized call.
+
+    A pure function of ``(spec.seed, spec.n_files, spec.footer_ratio)`` — the
+    single upfront draw of §4.2. Both :func:`generate_corpus` (local write) and
+    the PR 2 ``seed`` command call this, so a corpus and its uploaded copy carry
+    identical footers regardless of upload order.
+
+    Parameters
+    ----------
+    spec : FakeRawSpec
+        Corpus spec supplying seed, file count, and footer ratio.
+
+    Returns
+    -------
+    numpy.ndarray
+        A boolean vector of length ``spec.n_files``; ``True`` where a footer is
+        present.
+    """
     draws = np.random.default_rng(spec.seed).random(spec.n_files)
     return draws < spec.footer_ratio
 
@@ -247,7 +299,7 @@ def generate_corpus(spec: FakeRawSpec, out_dir: Path) -> Iterator[ManifestEntry]
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    flags = _footer_flags(spec)
+    flags = footer_flags(spec)
     for file_id in range(spec.n_files):
         out_path = out_dir / f"{file_id:08d}.raw"
         entry = generate_file(spec, file_id, bool(flags[file_id]), out_path)

@@ -12,13 +12,16 @@ dependencies = [
     "numpy",
     "pydantic>=2",
     "polars",
+    "s3fs",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
     "pytest-cov",
+    "pytest-asyncio",
     "psutil",
+    "moto[server]",
 ]
 
 [project.scripts]
@@ -34,8 +37,11 @@ packages = ["src/rgw_ingest_bench"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
 markers = [
     "integration: end-to-end CLI tests (subprocess, slow)",
+    "minio: integration tests against a live object store (subprocess, needs MinIO/RGW)",
+    "netem: latency-injection tests (needs Linux root + sudo tc)",
 ]
 
 [tool.coverage.run]
