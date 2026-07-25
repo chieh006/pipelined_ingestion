@@ -175,17 +175,24 @@ def test_rtt_probe_netem(tmp_path: Path) -> None:
     _require_live_store()
     netem = str(Path(__file__).resolve().parent.parent / "scripts" / "netem.sh")
 
+    # The script's own default resolves to docker0, which a Compose fixture never
+    # uses (its containers sit on a per-project bridge), so the delay would land
+    # on an idle interface and the assertion below would fail for the wrong
+    # reason. Default to loopback -- the leg a localhost endpoint really crosses
+    # -- while leaving NETEM_IFACE overridable for a bridge-delayed setup.
+    env = {**os.environ, "NETEM_IFACE": os.environ.get("NETEM_IFACE", "lo")}
+
     def probe_median() -> float:
         proc = _run_cli("rtt-probe", "--json")
         assert proc.returncode == 0, proc.stderr
         return json.loads(proc.stdout.strip())["median_ms"]
 
-    subprocess.run([netem, "clear"], check=False)
+    subprocess.run([netem, "clear"], check=False, env=env)
     baseline = probe_median()
     try:
-        subprocess.run([netem, "set", "5ms"], check=True)
+        subprocess.run([netem, "set", "5ms"], check=True, env=env)
         delayed = probe_median()
         assert delayed >= baseline + 8  # ~2 x 5 ms added, allowing slack
     finally:
-        subprocess.run([netem, "clear"], check=True)
+        subprocess.run([netem, "clear"], check=True, env=env)
     assert probe_median() < baseline + 4  # back to baseline

@@ -6,9 +6,15 @@ Running log of work done on the RGW pipelined-ingestion benchmark project.
 
 ---
 
-**Next up:** finish the §8.3 walkthrough — step 4, `uv run pytest -m minio -k throughput -s`, to watch the measured MiB/s; then open **PR 2** for review and
-implement PR 3 (V2 serial ranged reads + correctness gate) per
+**Next up:** **PR 2 is complete** — open it for review, then implement **PR 3**
+(V2 serial ranged reads, silver schema + correctness gate, `run` command) per
 [pr3_v2_serial_ranged_and_gate.md](design/pr3_v2_serial_ranged_and_gate.md).
+
+- **2026-07-24** — Finished the §8.3 walkthrough (steps 4–7), added `seed --clean`, and fixed several doc commands that could not do what they claimed.
+  - **`seed --clean`** — deletes the bucket before uploading; mutually exclusive with `--resume`. Needed because verify requires the bucket to hold *exactly* the manifest, so switching to a tier with fewer files (medium → large) failed on 9 500 stranded keys. New tests T16; fast gate still 100 % line/branch.
+  - **Live seed numbers** (MinIO): `small` 10 000 files / 1.191 GiB → **36.9 MiB/s**; `large` 500 files / 15.654 GiB → **157.7 MiB/s**. The gap is per-object overhead, not the store.
+  - **netem was delaying nothing** — `netem.sh` picks `docker0`, but Compose puts the fixture on its own bridge and `docker0` is `DOWN`, so an injected 1 ms left `rtt-probe` reading 0.065 ms. Fix: `NETEM_IFACE=lo`, which is also the leg a `localhost` endpoint really crosses (docker-proxy ends the handshake on loopback). Closed §10 Q2; I3 now passes `NETEM_IFACE` (default `lo`) itself.
+  - **Doc corrections** — three §8.3 commands promised output they could not produce: the `-s` "watch the MiB/s" recipe (I1 captures the subprocess stdout and prints nothing), the step-2 exports missing after a WSL2 restart, and the netem pytest line (needs `sudo`, else it silently skips). Also replaced the invented `--tier small` sample figures with measured ones.
 
 - **2026-07-23** — Ran the §8.3 `make`-path walkthrough (steps 1–3): replaced broken Docker Desktop WSL integration with **native Docker CE in WSL2** (systemd-managed), then `make minio-up` healthy and `pytest -m minio -v` → 2 passed.
 

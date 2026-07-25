@@ -221,6 +221,28 @@ def _existing_sizes(fs: Any, bucket: str) -> dict[str, int]:
     return sizes
 
 
+def _clean_bucket(fs: Any, bucket: str) -> None:
+    """Delete the bucket and everything in it, so the next seed starts empty.
+
+    Verification requires the bucket to hold *exactly* the planned manifest
+    (:func:`_verify_upload`), so a tier switch that shrinks the file count
+    leaves orphaned keys behind and fails. Dropping the bucket wholesale is the
+    cheapest way to restore that invariant; the caller recreates it.
+
+    Parameters
+    ----------
+    fs : s3fs.S3FileSystem
+        Filesystem handle for the store.
+    bucket : str
+        Bucket to remove. A missing bucket is not an error.
+    """
+    fs.invalidate_cache(bucket)
+    if fs.exists(bucket):
+        fs.rm(bucket, recursive=True)
+        logger.info(f"cleaned bucket '{bucket}' before seeding")
+    fs.invalidate_cache(bucket)
+
+
 def _upload_manifest_copy(fs: Any, bucket: str, manifest_path: Path) -> None:
     """Upload a provenance copy of the manifest to ``<bucket>/_manifest.jsonl``."""
     with fs.open(f"{bucket}/{MANIFEST_COPY_NAME}", "wb") as handle:
@@ -273,6 +295,7 @@ def seed_corpus(
     jobs: int = DEFAULT_JOBS,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     resume: bool = False,
+    clean: bool = False,
     verify: bool = True,
     max_retries: int = DEFAULT_MAX_RETRIES,
     manifest_dir: Path = Path("manifests"),
@@ -295,6 +318,11 @@ def seed_corpus(
         Streaming slab size in bytes. Defaults to 4 MiB.
     resume : bool, optional
         Skip keys already present at the manifest size. Defaults to False.
+    clean : bool, optional
+        Delete the bucket before uploading, so the corpus is its only content.
+        Needed when switching to a tier with *fewer* files: leftover keys the
+        new manifest does not cover would fail verification. Mutually
+        exclusive with ``resume``. Defaults to False.
     verify : bool, optional
         Run the post-upload LIST-vs-manifest verification. Defaults to True.
     max_retries : int, optional
@@ -333,6 +361,9 @@ def seed_corpus(
     # the store is unreachable (before any confusing s3 error).
     host, port = endpoint_host_port(str(cfg.endpoint_url))
     rtt = probe_rtt(host, port)
+
+    if clean:
+        _clean_bucket(fs, cfg.bucket)
 
     fs.makedirs(cfg.bucket, exist_ok=True)
 

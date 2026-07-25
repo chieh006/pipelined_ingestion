@@ -90,8 +90,16 @@ def _build_parser() -> argparse.ArgumentParser:
     seed.add_argument(
         "--jobs", type=int, default=DEFAULT_JOBS, help="upload concurrency"
     )
-    seed.add_argument(
+    # Contradictory by construction: --clean empties the bucket, leaving --resume
+    # nothing to skip.
+    reuse = seed.add_mutually_exclusive_group()
+    reuse.add_argument(
         "--resume", action="store_true", help="skip keys already present at size"
+    )
+    reuse.add_argument(
+        "--clean",
+        action="store_true",
+        help="delete the bucket first (required when switching to a smaller tier)",
     )
     seed.add_argument(
         "--no-verify",
@@ -238,6 +246,7 @@ def _cmd_seed(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             tier=tier,
             jobs=args.jobs,
             resume=args.resume,
+            clean=args.clean,
             verify=not args.no_verify,
             manifest_dir=args.manifest_out,
             results_path=args.results_dir / "seed.jsonl",

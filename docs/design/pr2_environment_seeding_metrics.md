@@ -269,9 +269,14 @@ Design points:
 
 ```bash
 uv run python -m rgw_ingest_bench seed --tier medium --bucket bronze --seed 42 \
-       [--endpoint http://localhost:8000] [--jobs 16] [--resume] [--no-verify] \
-       [--manifest-out manifests/] [--json]
+       [--endpoint http://localhost:8000] [--jobs 16] [--resume | --clean] \
+       [--no-verify] [--manifest-out manifests/] [--json]
 ```
+
+`--clean` drops the bucket before uploading. Needed because verification demands
+the bucket hold *exactly* the manifest (§5.1 step 4), so switching to a tier with
+**fewer** files strands the old corpus's extra keys and fails; it is mutually
+exclusive with `--resume`, which has nothing to skip in an emptied bucket.
 
 Tier/explicit-spec flag groups are shared with `generate` via a common
 `argparse` parent parser (defined once in `cli.py` — no duplicated flag
@@ -445,6 +450,7 @@ selects the fast gate.
 | T13 | `test_cli_seed_args` | bad tier, missing endpoint, conflicting flag groups → nonzero exit + usage; `rtt-probe` command wired |
 | T14 | `test_iter_file_chunks_equivalence` | PR 1 refactor guard: chunks concatenated == `generate_file` output byte-for-byte (complements PR 1 T9) |
 | T15 | `test_seed_json_summary` | `seed --json` (driven in-process via `cli.main([...])` against moto) prints one stats object `{files, bytes, gib, elapsed_s, mib_per_s, files_per_s}`; `files == n_files`, `bytes == Σ` manifest sizes, `gib == round(bytes/2**30, 3)`, rates self-consistent (`mib_per_s == bytes/elapsed_s/2**20`, `files_per_s == files/elapsed_s`) — covers the throughput-summary branch for the coverage gate; the figures equal the `results/seed.jsonl` `RunResult` row |
+| T16 | `test_seed_clean` | `--clean`: re-seeding a *smaller* spec into a populated bucket fails on the verify count (`expected 2 … found 6`) without the flag and succeeds with it, leaving only the new corpus's keys; `_clean_bucket` on an absent bucket is a no-op; `--clean --resume` is a usage error (mutually exclusive group) and the CLI forwards `clean=True` |
 
 ### 8.2 Integration tests (live object store)
 
@@ -458,9 +464,9 @@ and skipped locally by default (parent §12's "MinIO/moto integration marks").
 
 | # | Test | Asserts |
 |---|---|---|
-| I1 | `test_seed_throughput_cli` | **the CLI throughput check.** `seed --tier small --json` into the live bucket as a subprocess; parse the stats object `{files, bytes, gib, elapsed_s, mib_per_s, files_per_s}`. Assert `files == n_files` and `bytes == Σ` on-store `LIST` sizes (upload accounting is correct); `gib == round(bytes/2**30, 3)`; `mib_per_s == bytes/elapsed_s/2**20` within 1 % (**reported throughput is accurate**, not merely present); `elapsed_s ≤` the test's own wall-clock; an **opt-in floor** — when `BENCH_MIN_SEED_MIB_PER_S` is set, the measured `mib_per_s` must clear it; unset ⇒ accounting-only, so CI never flakes on hardware (suggested trusted-loopback value ≈ 5 MiB/s) — a serialized-upload / non-streaming regression trips wherever the floor is set; finally the stdout figures equal the `results/seed.jsonl` `RunResult` row (`wall_s`, `files_per_s`, byte counters) — CLI, sink, and store all agree. |
+| I1 | `test_seed_throughput_cli` | **the CLI throughput check.** `seed --tier small --json` into the live bucket as a subprocess; parse the stats object `{files, bytes, gib, elapsed_s, mib_per_s, files_per_s}`. Assert `files == n_files` and `bytes == Σ` on-store `LIST` sizes (upload accounting is correct); `gib == round(bytes/2**30, 3)`; `mib_per_s == bytes/elapsed_s/2**20` within 1 % (**reported throughput is accurate**, not merely present); `elapsed_s ≤` the test's own wall-clock; an **opt-in floor** — when `BENCH_MIN_SEED_MIB_PER_S` is set, the measured `mib_per_s` must clear it; unset ⇒ accounting-only, so CI never flakes on hardware (suggested trusted-loopback value ≈ 5 MiB/s) — a serialized-upload / non-streaming regression trips wherever the floor is set; finally the stdout figures equal the `results/seed.jsonl` `RunResult` row (`wall_s`, `files_per_s`, byte counters) — CLI, sink, and store all agree. **Reporting:** the subprocess's stdout is captured (it has to be — the test parses it), so the figures never reach the terminal; the test prints nothing by design. A tripped floor still names the number that failed, for free, via pytest's assertion rewriting (`assert 3.2 >= 50.0`). I1 is a safeguard, not a readout — the figure itself comes from the CLI (§8.3 step 5). |
 | I2 | `test_seed_correctness_minio` | the T9–T11 duplication against **real multipart**: object count/sizes/manifest + `RunResult` row (T9); truncate one object → verify exits nonzero naming the key (T10); interrupt-then-`--resume` uploads only the missing keys, and `--jobs 1` vs `--jobs 8` stay byte-identical (T11). Keeps moto honest about the multipart semantics RGW/MinIO actually enforce. |
-| I3 | `test_rtt_probe_netem` | the §6 latency loop end-to-end through the CLI: with `scripts/netem.sh set <d>` applied, `rtt-probe` reads median ≈ `2·d` + baseline; after `clear`, back to baseline. Marked `@pytest.mark.netem` and **skipped unless** `BENCH_NETEM=1` and the process can `sudo tc` (root + Linux) — otherwise it stays the §9 manual acceptance step. |
+| I3 | `test_rtt_probe_netem` | the §6 latency loop end-to-end through the CLI: with `scripts/netem.sh set <d>` applied, `rtt-probe` reads median ≈ `2·d` + baseline; after `clear`, back to baseline. Passes `NETEM_IFACE` (default `lo`) into every `netem.sh` call — the script's own default picks `docker0`, which a Compose fixture leaves idle, so the delay would miss the traffic and the assertion would fail for the wrong reason (§10 Q2). Marked `@pytest.mark.netem` and **skipped unless** `BENCH_NETEM=1` *and* the process is already root (`os.geteuid() == 0`): it invokes `netem.sh` bare, since a `sudo` password prompt would hang the run, so pytest itself must be launched under `sudo` (§8.3 step 6). A failed gate skips rather than fails — otherwise it stays the §9 manual acceptance step. |
 
 **Throughput contract (mirrors PR 1's `generate --json`).** So a test — or an
 operator — can *verify* seed throughput without scraping log lines, `seed` grows
@@ -500,20 +506,19 @@ export BENCH_S3_ACCESS_KEY=bench BENCH_S3_SECRET_KEY=bench-secret
 export BENCH_S3_KIND=minio           # must match the store you started
 ```
 
+> Steps 3-5 all require this step 2 first to bring up MinIO: the `export`s are shell-local and the
+> services carry no restart policy, so re-run step 2 in every new shell and
+> after any WSL2/Docker restart (`make minio-up` is idempotent if it's already
+> healthy).
+
 **3 — Run the integration tests** (`seed` correctness + the throughput check):
 
 ```bash
 uv run pytest -m minio -v
 ```
 
-**4 — Just the throughput test (I1), watching the number** — `-s` un-captures
-stdout so the measured MiB/s prints:
-
-```bash
-uv run pytest -m minio -k throughput -s
-```
-
-The absolute floor is opt-in: set `BENCH_MIN_SEED_MIB_PER_S` to enforce it on a
+**4 — Just the throughput test (I1), and diagnosing a floor failure.** The
+absolute floor is opt-in: set `BENCH_MIN_SEED_MIB_PER_S` to enforce it on a
 store/host you trust (leave it unset ⇒ accounting-only, so CI never flakes on
 hardware variance):
 
@@ -522,23 +527,77 @@ BENCH_MIN_SEED_MIB_PER_S=50 uv run pytest -m minio -k throughput
 # Windows PowerShell:  $env:BENCH_MIN_SEED_MIB_PER_S=50; uv run pytest -m minio -k throughput
 ```
 
+When the floor trips, pytest's assertion rewriting names the measured
+`mib_per_s` and the floor it missed (`assert 3.2 >= 50.0`) — no flags needed.
+On a passing run I1 prints nothing: it captures the CLI's stdout in order to
+parse it (§8.2 I1), so there is no output for `-s` to un-capture.
+
+That is deliberate — I1 is a safeguard, not a readout. It verifies the
+accounting (bytes match the store, the rates are self-consistent, CLI and
+`seed.jsonl` agree) and trips a coarse tripwire; the figure it checks is
+produced under test conditions (small tier, one run, no warmup) and is not a
+benchmark (§8.2). Numbers you quote come from step 5 and the PR 6 sweep.
+
 **5 — Verify seed throughput by hand (exactly what I1 automates):**
 
 ```bash
 uv run python -m rgw_ingest_bench seed --tier small --bucket bronze --seed 42 --json
-# {"files": 10000, "bytes": 1719664640, "gib": 1.602, "elapsed_s": 21.3, "mib_per_s": 77.0, "files_per_s": 469.5}
+# {"files": 10000, "bytes": 1278443520, "gib": 1.191, "elapsed_s": 33.02, "mib_per_s": 36.924, "files_per_s": 302.851}
 
 uv run python -m rgw_ingest_bench seed --tier small --bucket bronze --json | jq .mib_per_s
 ```
 
+**Switching tiers, or re-measuring from empty — add `--clean`:**
+
+```bash
+uv run python -m rgw_ingest_bench seed --tier large --bucket bronze --seed 42 --clean --json
+# INFO rgw_ingest_bench.seed: cleaned bucket 'bronze' before seeding
+# {"files": 500, "bytes": 16808509440, "gib": 15.654, "elapsed_s": 101.67, "mib_per_s": 157.663, "files_per_s": 4.918}
+```
+
+Without it, a bucket still holding a *larger* corpus fails verification
+(`verify: expected 500 objects in 'bronze', found 10000`) — the old keys the new
+manifest does not cover are still there. Same-tier reruns and *growing* switches
+(`large` → `small`) need no flag: every stale key is overwritten. `--clean` also
+gives a cold bucket when you want the figure measured against empty rather than
+over existing objects.
+
 **6 — (Linux, optional) verify the netem latency loop (I3):**
 
 ```bash
-make netem-set DELAY=1ms
-uv run python -m rgw_ingest_bench rtt-probe   # median ≈ 2 ms above baseline
-make netem-clear
-BENCH_NETEM=1 uv run pytest -m netem          # automates the above (needs sudo tc)
+# `make netem-set` resolves to docker0, which a Compose fixture never uses (its
+# containers sit on a per-project bridge) — name the interface the traffic really
+# crosses. NETEM_IFACE must be repeated on `clear`, or it clears the wrong one.
+sudo NETEM_IFACE=lo scripts/netem.sh clear     # drop any stale qdisc first
+sudo NETEM_IFACE=lo scripts/netem.sh set 1ms
+uv run python -m rgw_ingest_bench rtt-probe    # median ≈ 2 ms above baseline
+sudo NETEM_IFACE=lo scripts/netem.sh clear
+
+# I3 automates the four steps above — but it must run AS ROOT, not via the
+# script's own sudo: the test calls `scripts/netem.sh` bare, because a sudo
+# password prompt mid-run would hang pytest. `-E` carries BENCH_S3_* across.
+# I3 defaults NETEM_IFACE to lo; set it here only to delay a different leg.
+sudo -E env "PATH=$PATH" NETEM_IFACE=lo BENCH_NETEM=1 uv run pytest -m netem -v
 ```
+
+I3 is gated on **both** `BENCH_NETEM=1` and `os.geteuid() == 0`, and a failed gate
+is a `pytest.skip`, not a failure — so running it without `sudo` reports success
+while testing nothing. Check for `PASSED`, never a bare green summary.
+
+`NETEM_IFACE=lo` rather than the script's default: with the store published on
+`localhost`, traffic goes *client → loopback → docker-proxy → project bridge →
+container*, and `docker0` is on none of those legs. Delaying the bridge does not
+work either — docker-proxy accepts the handshake on loopback before forwarding,
+so `rtt-probe` would read baseline while the data path was genuinely slowed:
+results labelled "no latency" that aren't. On `lo` the probe and the benchmark
+traffic cross the same delayed leg, so the measurement matches the run. (Verified
+on the WSL2 box: `docker0` is `DOWN`, the container sits on the Compose bridge.
+This supersedes §10 Q2 — the mismatch is structural, not WSL2 flakiness.)
+
+`1ms` (⇒ ≈ 2 ms RTT) is the recommended starting value because it moves the
+fixture from "storage on the same machine" (~0.05 ms, where a serial and a
+pipelined reader look identical) to "storage one rack away" — the regime real
+clients run in, and the only one where the V1–V3 comparison has any signal.
 
 **7 — Tear down:**
 
@@ -565,8 +624,9 @@ Notes:
       WSL2 box; RSS during seed stays ≈ flat (streamed path verified).
 - [ ] `seed --tier medium` completes; verify step passes; rerun with
       `--resume` uploads zero files.
-- [ ] `make netem-set DELAY=1ms` → `rtt-probe` reports ≈ 2 ms above baseline;
-      `netem-clear` restores it (numbers recorded in the PR description).
+- [ ] `NETEM_IFACE=lo scripts/netem.sh set 1ms` → `rtt-probe` reports ≈ 2 ms above
+      baseline; `clear` (same `NETEM_IFACE`) restores it (numbers recorded in the
+      PR description). Bare `make netem-set` is *not* sufficient — see §8.3 step 6.
 - [ ] `results/seed.jsonl` row validates against `RunResult`, contains
       measured RTT + all package versions + git SHA.
 - [ ] Fast gate green without Docker (`pytest -m "not minio and not netem"`,
@@ -583,10 +643,17 @@ Notes:
    pending. First task of this PR is that smoke test; the compose `<pinned-digest>`
    and exact env keys get filled in from it. Fallback order stands: demo
    container → microceph → MinIO (correctness only).
-2. **Veth discovery robustness on WSL2** — if the container-veth lookup proves
-   brittle under Docker Desktop's network plumbing, fall back to `NETEM_IFACE=lo`
-   and note in results that *all* loopback traffic was delayed (acceptable:
-   the box runs nothing else during benchmark runs).
+2. ~~**Veth discovery robustness on WSL2**~~ — **resolved: `resolve_iface()` is
+   wrong for this fixture, and not only on WSL2.** It picks `docker0` whenever
+   `ip link show docker0` succeeds, but Compose puts the fixture on a per-project
+   bridge (`br-<id>`), leaving `docker0` `DOWN` and empty — so the delay lands on
+   an interface carrying no packets. Compounding it, a `localhost` endpoint
+   terminates its handshake at docker-proxy, so delaying the correct bridge is
+   still invisible to `rtt-probe`. Documented workaround is `NETEM_IFACE=lo`
+   (§8.3 step 6), which delays *all* loopback traffic — acceptable, since the box
+   runs nothing else during benchmark runs, and it keeps probe and data traffic on
+   the same delayed leg. **Open follow-up:** teach `resolve_iface()` to select the
+   UP bridge that actually carries container traffic instead of assuming `docker0`.
 3. **moto vs multipart fidelity** — moto's multipart implementation is good
    but not RGW; the `@pytest.mark.minio` duplicates exist precisely to catch
    drift. If moto misbehaves on streamed multipart, T9–T11 move to

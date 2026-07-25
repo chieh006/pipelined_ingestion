@@ -174,6 +174,67 @@ def test_seed_resume_noop_when_complete(
     assert stats["files"] == tiny_spec.n_files
 
 
+# ------------------------------------------------------------------- T16 (--clean)
+def _shrunk(spec: FakeRawSpec) -> FakeRawSpec:
+    """Return ``spec`` with fewer files, so old keys would be stranded."""
+    return spec.model_copy(update={"n_files": 2})
+
+
+def test_seed_shrinking_tier_fails_without_clean(
+    s3_cfg: S3Config, tiny_spec: FakeRawSpec, tmp_path
+) -> None:
+    """Orphaned keys from a larger corpus trip the verify count check."""
+    seed_corpus(
+        tiny_spec,
+        s3_cfg,
+        tier="tiny",
+        manifest_dir=tmp_path / "m",
+        results_path=tmp_path / "r" / "s.jsonl",
+    )
+    with pytest.raises(SeedError) as excinfo:
+        seed_corpus(
+            _shrunk(tiny_spec),
+            s3_cfg,
+            tier="tinier",
+            manifest_dir=tmp_path / "m",
+            results_path=tmp_path / "r" / "s.jsonl",
+        )
+    message = str(excinfo.value)
+    assert "expected 2" in message and f"found {tiny_spec.n_files}" in message
+
+
+def test_seed_clean_allows_shrinking_tier(
+    s3_cfg: S3Config, tiny_spec: FakeRawSpec, tmp_path
+) -> None:
+    """``clean=True`` drops the stale corpus, so the smaller one verifies."""
+    seed_corpus(
+        tiny_spec,
+        s3_cfg,
+        tier="tiny",
+        manifest_dir=tmp_path / "m",
+        results_path=tmp_path / "r" / "s.jsonl",
+    )
+    smaller = _shrunk(tiny_spec)
+    stats = seed_corpus(
+        smaller,
+        s3_cfg,
+        tier="tinier",
+        clean=True,
+        manifest_dir=tmp_path / "m",
+        results_path=tmp_path / "r" / "s.jsonl",
+    )
+    raw = {key: size for key, size in _listing(s3_cfg).items() if key.endswith(".raw")}
+    assert stats["files"] == smaller.n_files
+    assert sorted(raw) == [entry.path for entry in plan_manifest(smaller)]
+
+
+def test_clean_bucket_missing_is_noop(s3_cfg: S3Config) -> None:
+    """Cleaning a bucket that was never created is silently fine."""
+    fs = make_fs(s3_cfg)
+    seed._clean_bucket(fs, "never-created-bucket")
+    assert not fs.exists("never-created-bucket")
+
+
 def test_seed_determinism_across_jobs(
     moto_endpoint: str, tiny_spec: FakeRawSpec, tmp_path
 ) -> None:

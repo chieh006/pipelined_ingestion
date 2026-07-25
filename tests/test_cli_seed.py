@@ -122,6 +122,38 @@ def test_cli_seed_conflicting_spec() -> None:
         )
 
 
+def test_cli_seed_clean_conflicts_with_resume(capsys) -> None:
+    """``--clean`` empties the bucket, so pairing it with ``--resume`` is invalid."""
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            ["seed", "--tier", "small", "--clean", "--resume",
+             "--endpoint", "http://x:1", "--access-key", "a", "--secret-key", "s"]
+        )
+    assert excinfo.value.code != 0
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_cli_seed_clean_forwarded(s3_cfg, tiny_spec, tmp_path, monkeypatch) -> None:
+    """The CLI flag reaches ``seed_corpus`` as ``clean=True``."""
+    seen = {}
+
+    def spy(spec, cfg, **kwargs):
+        seen.update(kwargs)
+        return {"files": 0, "bytes": 0, "gib": 0.0, "elapsed_s": 1.0,
+                "mib_per_s": 0.0, "files_per_s": 0.0}
+
+    monkeypatch.setattr(cli, "seed_corpus", spy)
+    code = cli.main(
+        ["seed", "--n-files", "2", "--width", "8", "--height", "8",
+         "--channels", "1", "--clean", "--json",
+         "--endpoint", str(s3_cfg.endpoint_url),
+         "--access-key", "a", "--secret-key", "s",
+         "--manifest-out", str(tmp_path / "m"), "--results-dir", str(tmp_path / "r")]
+    )
+    assert code == 0
+    assert seen["clean"] is True
+
+
 def test_cli_seed_unreachable_returns_1(tmp_path, monkeypatch, capsys) -> None:
     """A store that refuses the connection makes seed exit non-zero cleanly."""
     monkeypatch.setenv("BENCH_S3_ENDPOINT", _closed_endpoint())
